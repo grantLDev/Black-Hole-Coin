@@ -33,6 +33,32 @@ export interface QualityProfile {
   /** Octaves in the Milky Way FBM. The single most expensive knob in the sky. */
   readonly skyFbmOctaves: number;
   /**
+   * Compile-time ceiling on geodesic march steps, and the runtime budget the
+   * shader is actually given. They are equal here — the ceiling exists so the
+   * loop bound stays a constant for the driver, and the uniform exists so the
+   * budget can be changed without a recompile.
+   *
+   * This is the dominant cost in the whole renderer. Every other knob in this
+   * file is a rounding error next to it.
+   */
+  readonly marchSteps: number;
+  /**
+   * Geometric step criterion: `dt <= stepScale * r`. Larger is coarser. Raised
+   * on lower tiers so a smaller step budget still reaches the escape radius.
+   */
+  readonly marchStepScale: number;
+  /**
+   * Angular step criterion: `dt <= turnLimit / |accel|`, in radians of
+   * trajectory turn per step. This is the knob that resolves the photon ring —
+   * at 0.055 rad a ray needs ~114 steps to orbit the photon sphere once, which
+   * is what keeps the ring a sharp line instead of a smear. Raising it is the
+   * first thing that shows on a low tier, and the last thing worth raising.
+   */
+  readonly marchTurnLimit: number;
+  /** Octaves in the accretion disk's filament FBM. Below 3, the domain warp
+   * is compiled out entirely. */
+  readonly diskFbmOctaves: number;
+  /**
    * Frame time above which this tier is considered unsustainable, in ms.
    * `Infinity` on the bottom tier — there is nowhere left to fall.
    */
@@ -44,8 +70,15 @@ export const QUALITY_PROFILES: Readonly<Record<QualityTier, QualityProfile>> = {
     tier: "high",
     maxPixelRatio: 2,
     renderScale: 1,
-    maxPixels: 3_700_000,
+    // Comfortably above 1080p (2.07M) and below 1440p at DPR 2. The pixel
+    // budgets all came down when the marcher landed: the sky cost a few dozen
+    // ALU ops per pixel, the geodesic integration costs a few thousand.
+    maxPixels: 2_600_000,
     skyFbmOctaves: 5,
+    marchSteps: 300,
+    marchStepScale: 0.11,
+    marchTurnLimit: 0.055,
+    diskFbmOctaves: 3,
     // Sustained below 50fps on "high" means "high" is the wrong call.
     downgradeAboveMs: 1000 / 50,
   },
@@ -53,16 +86,24 @@ export const QUALITY_PROFILES: Readonly<Record<QualityTier, QualityProfile>> = {
     tier: "medium",
     maxPixelRatio: 2,
     renderScale: 0.85,
-    maxPixels: 2_400_000,
+    maxPixels: 1_700_000,
     skyFbmOctaves: 4,
+    marchSteps: 180,
+    marchStepScale: 0.16,
+    marchTurnLimit: 0.085,
+    diskFbmOctaves: 3,
     downgradeAboveMs: 1000 / 38,
   },
   low: {
     tier: "low",
     maxPixelRatio: 1.5,
     renderScale: 0.7,
-    maxPixels: 1_400_000,
+    maxPixels: 1_000_000,
     skyFbmOctaves: 3,
+    marchSteps: 90,
+    marchStepScale: 0.26,
+    marchTurnLimit: 0.15,
+    diskFbmOctaves: 2,
     downgradeAboveMs: Number.POSITIVE_INFINITY,
   },
 } as const;

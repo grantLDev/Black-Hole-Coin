@@ -14,7 +14,7 @@
 /** Valid tier indices, 0..11. */
 export type TierIndex = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11;
 
-/** `#rrggbb`. Converted to a vec3 for the shader by `hexToRgb`. */
+/** `#rrggbb`, authored in sRGB. Converted for the shader by `hexToLinearRgb`. */
 export type HexColor = `#${string}`;
 
 export interface Tier {
@@ -345,10 +345,39 @@ export function progressToNextTier(athUsd: number): number {
   return Math.min(1, Math.max(0, (at - lo) / (hi - lo)));
 }
 
-/** `#rrggbb` -> linear-ish [r, g, b] in 0..1, ready for a vec3 uniform. */
+/**
+ * `#rrggbb` -> sRGB [r, g, b] in 0..1. For CSS and any other display-space use.
+ *
+ * NOT for shader uniforms: the renderer works in linear radiance and applies
+ * the sRGB transfer function itself at the very end. Use `hexToLinearRgb`.
+ */
 export function hexToRgb(hex: HexColor): [number, number, number] {
   const v = parseInt(hex.slice(1), 16);
   return [((v >> 16) & 255) / 255, ((v >> 8) & 255) / 255, (v & 255) / 255];
+}
+
+/** The sRGB electro-optical transfer function, i.e. the inverse of the OETF. */
+function srgbToLinear(channel: number): number {
+  return channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
+}
+
+/**
+ * `#rrggbb` -> LINEAR [r, g, b] in 0..1, ready for a vec3 uniform.
+ *
+ * The hex values in the tier table are picked by eye against a screen, which
+ * makes them sRGB. The shader multiplies them by emissivity and a Doppler
+ * factor and tone maps the result, all of which are linear-light operations,
+ * so they have to be decoded first.
+ *
+ * Skipping this is not a subtle error. sRGB 0.38 decodes to linear 0.117 — a
+ * factor of 3.2 on the green channel alone — so an orange authored as #dd6116
+ * arrives at the GPU with far too much green and renders as muddy brown. The
+ * difference between the tier table's intent and what reaches the screen is
+ * the difference between a vivid ember disk and a sepia one.
+ */
+export function hexToLinearRgb(hex: HexColor): [number, number, number] {
+  const [r, g, b] = hexToRgb(hex);
+  return [srgbToLinear(r), srgbToLinear(g), srgbToLinear(b)];
 }
 
 /** Compact USD label for the HUD: $10K, $1M, $10M. */

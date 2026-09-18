@@ -28,6 +28,7 @@ import {
 
 import { FullscreenPass } from "./FullscreenPass";
 import { OrbitCamera, type OrbitCameraOptions } from "./OrbitCamera";
+import { VisualState } from "./VisualState";
 import {
   QualityGovernor,
   detectQualityTier,
@@ -40,6 +41,22 @@ import {
 const MAX_FRAME_DELTA_MS = 100;
 /** How often onStats fires, in ms. */
 const STATS_INTERVAL_MS = 250;
+
+/**
+ * Period at which the shader's time uniform wraps, in seconds.
+ *
+ * The disk's noise is advected by `phi - omega(r) * t`, and that angle goes
+ * through sin/cos. A float32 argument of ~5000 rad still resolves to about
+ * 3e-4 rad, which is invisible; at ~1e6 it is not. Six hours puts the largest
+ * argument (the inner edge, at omega ~ 0.22 rad/s x 2) near 9500 rad and keeps
+ * a comfortable margin.
+ *
+ * The wrap is not seamless — omega varies continuously with radius, so no
+ * single period is a whole number of revolutions at every radius — so it costs
+ * one re-phase of the disk texture after six hours of uninterrupted playback.
+ * The camera, which uses unwrapped time, does not jump.
+ */
+const SHADER_TIME_WRAP_SECONDS = 6 * 60 * 60;
 
 const CONTEXT_ATTRIBUTES: WebGLContextAttributes = {
   alpha: false,
@@ -58,6 +75,8 @@ export interface RendererStats {
   readonly pixelRatio: number;
   readonly bufferWidth: number;
   readonly bufferHeight: number;
+  /** March budget the shader is currently running, for the debug overlay. */
+  readonly marchSteps: number;
 }
 
 export interface RendererOptions {
@@ -73,6 +92,21 @@ export interface RendererOptions {
    * shader get compared pixel for pixel.
    */
   readonly fixedTime?: number;
+  /**
+   * Starting tier index, 0..11. Ratcheted from here up by `setTier`; see
+   * VisualState for why the renderer keeps its own ratchet.
+   */
+  readonly tier?: number;
+  /**
+   * Force an exact drawing-buffer size in device pixels, ignoring CSS size and
+   * devicePixelRatio.
+   *
+   * This exists for benchmarking. "Frame time at 1080p" is only a meaningful
+   * number if the buffer really is 1920x1080, and every other path here sizes
+   * the buffer from the viewport and the quality profile, which is exactly the
+   * right behaviour for a real page and exactly the wrong one for a measurement.
+   */
+  readonly bufferSize?: { readonly width: number; readonly height: number };
   /** Fires roughly four times a second while the loop is running. */
   readonly onStats?: (stats: RendererStats) => void;
 }
@@ -83,8 +117,10 @@ export class SingularityRenderer {
   private readonly pass: FullscreenPass;
   private readonly camera: OrbitCamera;
   private readonly governor: QualityGovernor;
+  private readonly visuals: VisualState;
   private readonly onStats?: (stats: RendererStats) => void;
   private readonly fixedTime: number | null;
+  private readonly bufferSize: { readonly width: number; readonly height: number } | null;
 
   private rafId: number | null = null;
   /** Timestamp of the previous frame, or null after a start or resume. */
@@ -104,6 +140,7 @@ export class SingularityRenderer {
     this.canvas = options.canvas;
     this.onStats = options.onStats;
     this.fixedTime = Number.isFinite(options.fixedTime) ? (options.fixedTime as number) : null;
+    this.bufferSize = options.bufferSize ?? null;
 
     // A canvas can only ever hold one context, and a second getContext() call
     // returns the first one. That is exactly the behaviour we want: React
@@ -138,7 +175,8 @@ export class SingularityRenderer {
     });
 
     this.camera = new OrbitCamera(options.camera);
-    this.pass = new FullscreenPass(this.governor.current.skyFbmOctaves);
+    this.visuals = new VisualState(options.tier ?? 0);
+    this.pass = new FullscreenPass(this.governor.current);
 
     this.attachListeners();
     this.resize();
@@ -146,6 +184,42 @@ export class SingularityRenderer {
 
   get quality(): QualityTier {
     return this.governor.current.tier;
+  }
+
+  /** March budget of the active quality profile. */
+  get marchSteps(): number {
+    return this.governor.current.marchSteps;
+  }
+
+  /** The smoothed tier state driving the shader. */
+  get visualState(): VisualState {
+    return this.visuals;
+  }
+
+  /**
+   * Aim the visuals at a tier index, 0..11.
+   *
+   * Ratcheted, and deliberately so — see VisualState. The transition is
+   * smoothed over a couple of seconds; jets fade in over four and never out.
+   */
+  setTier(index: number): void {
+    this.visuals.setTier(index);
+  }
+
+  /** Vertical field of view in degrees. Applied on the next frame. */
+  setFov(degrees: number): void {
+    this.camera.setFov(degrees);
+  }
+
+  /**
+   * Override the geodesic march budget without a recompile.
+   *
+   * Clamped to the compiled `MARCH_STEPS` ceiling of the active quality
+   * profile; a later `setQuality` from the governor resets it to that profile's
+   * own value.
+   */
+  setQualitySteps(steps: number): void {
+    this.pass.setQualitySteps(steps);
   }
 
   /** Begin (or resume) the frame loop. No-op if hidden, disposed, or running. */
@@ -207,7 +281,9 @@ export class SingularityRenderer {
     const frameMs = now - previous;
 
     // Clamped so a GC pause or a device sleep cannot teleport the camera.
-    this.elapsed += Math.min(frameMs, MAX_FRAME_DELTA_MS) / 1000;
+    const deltaSeconds = Math.min(frameMs, MAX_FRAME_DELTA_MS) / 1000;
+    this.elapsed += deltaSeconds;
+    this.visuals.update(deltaSeconds);
 
     this.draw();
     this.governor.sample(frameMs);
@@ -215,8 +291,13 @@ export class SingularityRenderer {
   };
 
   private draw(): void {
-    this.camera.update(this.fixedTime ?? this.elapsed);
+    const sceneTime = this.fixedTime ?? this.elapsed;
+    this.camera.update(sceneTime);
     this.pass.setCamera(this.camera);
+    // Wrapped only for the shader: see SHADER_TIME_WRAP_SECONDS. `%` on a
+    // non-negative left operand is a plain modulo here.
+    this.pass.setTime(sceneTime % SHADER_TIME_WRAP_SECONDS);
+    this.pass.setVisuals(this.visuals.read());
     this.pass.setExposure(this.renderer.toneMappingExposure);
     this.pass.render(this.renderer);
   }
@@ -238,6 +319,7 @@ export class SingularityRenderer {
       pixelRatio: this.renderer.getPixelRatio(),
       bufferWidth: gl.drawingBufferWidth,
       bufferHeight: gl.drawingBufferHeight,
+      marchSteps: this.governor.current.marchSteps,
     });
 
     this.statsWindowStart = now;
@@ -246,6 +328,17 @@ export class SingularityRenderer {
   }
 
   private resize(): void {
+    // Benchmark path: the buffer is pinned, so neither the viewport nor the
+    // quality profile's pixel budget gets a say in how many pixels are shaded.
+    if (this.bufferSize) {
+      this.renderer.setPixelRatio(1);
+      this.renderer.setSize(this.bufferSize.width, this.bufferSize.height, false);
+      const buffer = this.renderer.getContext();
+      this.pass.setSize(buffer.drawingBufferWidth, buffer.drawingBufferHeight);
+      this.governor.reset();
+      return;
+    }
+
     const rect = this.canvas.getBoundingClientRect();
     const cssWidth = Math.max(1, rect.width || this.canvas.clientWidth);
     const cssHeight = Math.max(1, rect.height || this.canvas.clientHeight);
@@ -272,7 +365,7 @@ export class SingularityRenderer {
   }
 
   private readonly handleQualityChange = (profile: QualityProfile): void => {
-    this.pass.setSkyFbmOctaves(profile.skyFbmOctaves);
+    this.pass.setQuality(profile);
     this.resize();
   };
 

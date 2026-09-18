@@ -328,9 +328,12 @@ matrix anywhere — the image is raymarched per pixel from a ray.
 | `lib/gl/Renderer.ts` | WebGL2 context, frame loop, resize, teardown, quality governor |
 | `lib/gl/FullscreenPass.ts` | The triangle, the material, and the uniforms |
 | `lib/gl/OrbitCamera.ts` | Ray origin + orthonormal basis + FOV |
+| `lib/gl/VisualState.ts` | Tier table → smoothed, ratcheted shader uniforms |
 | `lib/gl/quality.ts` | Quality tiers, device detection, runtime governor |
+| `lib/gl/shaders/blackhole.glsl.ts` | Geodesic marcher, accretion disk, jets |
 | `lib/gl/shaders/*.glsl.ts` | GLSL as template literals |
 | `components/RendererMount.tsx` | Attaches the renderer to the server-rendered canvas |
+| `scripts/capture.ts` | Headless screenshot + frame-time harness |
 
 ### Why these choices
 
@@ -394,13 +397,168 @@ different devices and degenerates into stripes on some mobile drivers.
 are tuned against ACES specifically: ACES multiplies small inputs by roughly
 0.1 and clips anything under ~0.0022 linear to black.
 
+### The black hole
+
+`traceBlackHole(vec3 origin, vec3 rayDir)` produces everything in the frame
+that is not background sky, by integrating null geodesics through a
+Schwarzschild metric in units where the Schwarzschild radius **rs = 1**.
+Nothing is a textured sphere, a billboard, or a particle system.
+
+**The integrator.** A photon's orbit in Schwarzschild obeys
+`d²u/dφ² + u = (3/2) rs u²` with `u = 1/r`, which in Cartesian form with
+`h = r × v` conserved is
+
+```
+accel = -1.5 * h² * pos / |pos|⁵
+```
+
+That is not an approximation of the trajectory *shape* — substituting
+`r = 1/u` and reparameterising to φ recovers the orbit equation exactly. What
+it gives up is the parameterisation: `|v|` drifts along the path because the
+acceleration is not perpendicular to the velocity. That costs nothing here,
+because every consumer wants a direction or a position, never a speed. `h` is
+also conserved *exactly* by the update (`dh/dλ = r × a + v × v`, and `a` is
+parallel to `r`), which is why the photon ring stays sharp over hundreds of
+steps instead of drifting into a smear.
+
+Two numbers fall out of this and appear nowhere in the source: the photon
+sphere at r = 1.5, and the apparent shadow radius at `3√3/2 ≈ 2.598 rs`. That
+is the whole point of integrating rather than faking — a hand-drawn disc of
+radius 2.6 would not also produce the photon ring, and a hand-drawn ring would
+not also bend the star field around it.
+
+**Adaptive stepping** is why the ring is sharp and the rest is affordable. A
+fixed step that resolves r = 1.5 is ~100x smaller than one that suffices at
+r = 40. Two criteria run, and the smaller wins:
+
+1. `dt ≤ stepScale · r` — geometric, keeps the step a fixed fraction of the
+   distance to the hole.
+2. `dt ≤ turnLimit / |accel|` — angular, bounds how far the ray may *turn* in
+   one step.
+
+Criterion 2 resolves the photon ring and is self-tuning, since `|accel|` is
+largest exactly where the trajectory curves hardest. Criterion 1 makes most of
+the screen nearly free: a ray with impact parameter 20 has `|accel| ≈ 0.004` at
+closest approach, so it escapes in about a dozen steps.
+
+**Disk crossings are detected by a sign change in `pos.y`** between steps and
+interpolated to the exact plane, and the marcher does **not** stop at the first
+hit. A strongly lensed ray dives through the disk, wraps behind the hole and
+comes back through it; every crossing is accumulated. That is the entire
+mechanism behind the far side of the disk appearing both above *and* below the
+shadow. There is no second disk and no mirrored geometry.
+
+This also means the camera must never sit exactly in the disk plane. A ray cast
+from `y = 0` along the equator keeps `y = 0` for its whole geodesic, never
+registers a crossing, and the near side of the disk silently vanishes. The
+camera's elevation therefore has a **bias**, not a sweep through zero.
+
+**Doppler beaming** is what sells it. At each crossing the local orbital speed
+is `β = √(M/(r−2M))` with `M = rs/2` — exactly 0.5c at the ISCO, which is the
+standard check that the expression is right — and
+
+```
+δ = 1 / (γ (1 + β⃗ · dir))
+```
+
+with `dir` running camera → emitter, so `−dir` is the emitter → observer
+direction. Getting that sign backwards flips which limb is bright and *still
+looks plausible*, which is why it is spelled out in the source. Intensity is
+multiplied by δ³; even at δ³ the inner edge runs about 100:1 between its
+approaching and receding limbs. Gravitational redshift contributes a further
+`√(1 − 1/r)` on energy.
+
+`dir` is the ray's **local** direction at the crossing, which after lensing is
+nothing like the direction it left the camera with. Using the camera ray would
+beam the lensed far side as if it were the near side, and the over-and-under
+wrap would come out symmetric and dead.
+
+**The disk is a slab, not a plane.** Optical depth at a crossing is
+`density · opacity · 2H(r)/|dir.y|` — the analytic path length through a slab
+of half-thickness `H(r)`, which is puffy at the inner edge and thin outside it.
+That single term is what gives a zero-height crossing test real thickness: a
+grazing ray accumulates many times the optical depth of a steep one, so the
+disk turns opaque edge-on and translucent from above, which is most of why the
+near limb reads as solid while the far side glows through it.
+
+**Filament noise** is sampled on a circle — the angular coordinate arrives as
+`(cos a, sin a)`, not as the angle — so it is seamless in φ with no tear at
+±π, and scaling the circle's radius *is* the angular frequency, so the higher
+octaves need no second `sin`/`cos`. It is strongly anisotropic: at r = 4 one
+noise cell spans ~2.5 rs of arc but only ~0.34 rs of radius, so features come
+out ~7x longer than they are wide. Keplerian shear (`ω ∝ r^-1.5`) advects it,
+so the inner bands visibly outrun the outer ones and wind the filaments into
+spirals. Nothing draws a spiral; the shear *is* the spiral.
+
+**Colour.** The temperature profile is the physical `T ∝ r^-0.75`, shifted into
+the observer's frame by `δ · √(1 − 1/r)` and read through a ramp that extends
+*past* both tier colours — into ember below and blue-white above. Clamping to
+the two tier stops instead would leave the disk uniformly lit no matter how
+hard it is beamed. The tier hexes are authored in sRGB and decoded to linear
+before they reach the GPU (`hexToLinearRgb`); skipping that decode is a factor
+of ~3 on the green channel and renders a vivid ember disk as sepia.
+
+**Jets** (tier 9+) are volumetric, integrated along the same march with the
+emission scaled by `dt` so the result is independent of a step size that varies
+by three orders of magnitude along one ray. They are gated behind
+`uJetStrength > 0`, so at tiers 0–8 they cost one comparison per step. The fade
+is a **linear 4-second ramp with a smoothstep ease**, latched on: no code path
+lowers `jetStrength` once it has begun to rise, including `setTier(0)`.
+
+**Two deliberate departures from physics**, both flagged in the source:
+
+- The disk's inner edge is at **2.2 rs**, not the Schwarzschild ISCO at 3 rs.
+  Gargantua is a near-extremal Kerr hole whose prograde ISCO sits just outside
+  the horizon; stopping at 3 rs leaves a visible gap between the disk and the
+  shadow that reads immediately as wrong. 2.2 is still outside the photon
+  sphere at 1.5.
+- Radial **brightness** falls as `r^-1.6`, not the Stefan–Boltzmann `r^-3` that
+  `T ∝ r^-0.75` implies. At `r^-3` the outer disk is ~170x dimmer than the
+  inner edge and tone maps to black. The *temperature* profile is left at the
+  physical −0.75, so the colours stay honest.
+
+### Tier uniforms
+
+`lib/gl/VisualState.ts` is the only part of the renderer that knows tiers
+exist. The tier table holds step values — a tier is a discrete achievement —
+and the shader needs continuous ones, so this is the low-pass filter between
+them. Interpolation is exponential smoothing with a frame-rate-independent
+coefficient, `1 − exp(−dt/τ)`; the naive `x += (target − x) · k` form converges
+at a speed that depends on frame rate.
+
+It keeps its **own tier ratchet**, refusing any index lower than one it has
+already seen. The authoritative ratchet lives in the data layer against the
+KV-persisted ATH, but a stale poll, a degraded last-known-good value, or a tab
+restored from bfcache could each hand the renderer a lower tier than it is
+currently showing. The cheapest place to make a backwards visual impossible is
+the last gate before the GPU.
+
 ### Quality tiers
 
 A raymarched fragment shader is almost purely fill-rate bound, so the two
 levers that matter are how many pixels get shaded and how much work each pixel
 does. Both are in `lib/gl/quality.ts`: `maxPixelRatio`, `renderScale`, a hard
 `maxPixels` ceiling (a 5K display at DPR 2 asks for ~14.7M pixels), and the
-Milky Way FBM octave count, which arrives in the shader as a `#define`.
+FBM octave counts and march budget, which arrive in the shader as `#define`s.
+
+| Knob | high | medium | low |
+| --- | --- | --- | --- |
+| `marchSteps` | 300 | 180 | 90 |
+| `marchStepScale` | 0.11 | 0.16 | 0.26 |
+| `marchTurnLimit` | 0.055 | 0.085 | 0.15 |
+| `diskFbmOctaves` | 3 | 3 | 2 |
+| `skyFbmOctaves` | 5 | 4 | 3 |
+| `renderScale` | 1.0 | 0.85 | 0.7 |
+| `maxPixels` | 2.6M | 1.7M | 1.0M |
+
+`marchSteps` dominates everything else in this table combined.
+`marchTurnLimit` is the knob that resolves the photon ring — at 0.055 rad a ray
+needs ~114 steps to orbit the photon sphere once — and is the first thing that
+shows on a low tier.
+
+The march budget is *both* a `#define` (`MARCH_STEPS`, the loop bound, so the
+driver can allocate registers sanely) and a uniform (`uQualitySteps`, clamped
+to that ceiling, so it can be changed without a recompile).
 
 The governor is **downgrade-only**. A bidirectional one oscillates: it drops a
 tier, the frame budget recovers *because* it dropped, it steps back up, and the
@@ -418,10 +576,40 @@ phone's battery rendering a shader nobody can see.
 | `?debug` | Frame time, active tier, pixel ratio and buffer size overlay |
 | `?quality=low\|medium\|high` | Pin a tier instead of detecting one |
 | `?t=33.4` | Freeze scene time, to inspect one fixed view |
+| `?tier=9` | Pin a market-cap tier, 0–11. Jets unlock at 9 |
+| `?fov=13` | Vertical field of view in degrees. Narrow values inspect the photon ring |
+| `?steps=140` | Override the march budget, under the compiled ceiling |
+| `?bench` | Pin a 1920x1080 buffer, measure frame time, publish `window.__singularityBench` |
 
 They read from the URL rather than `NODE_ENV` because the governor's behaviour
 on a real device is exactly what needs inspecting in production. `?t=` is how
-two revisions of the shader get compared pixel for pixel.
+two revisions of the shader get compared pixel for pixel — the elevation sweep
+has a 134s period, so pinning scene time is also how the inclination is varied.
+
+### Measuring frame time
+
+`?bench` pins the drawing buffer to exactly 1920x1080 regardless of viewport or
+device pixel ratio, discards two seconds of warm-up, and then times `rAF`
+deltas for six seconds. It times whole frames rather than wrapping the draw
+call: a `gl.finish()` would give a tighter GPU number and a worse answer, since
+it serialises a pipeline that normally overlaps.
+
+`scripts/capture.ts` drives the real page in a real browser rather than
+re-implementing the shader in a test rig, because the thing most likely to be
+wrong is the interaction between the quality defines, the uniform plumbing and
+the GLSL:
+
+```bash
+npx next start                      # or: npm run dev
+npm run capture                     # screenshots across tiers, times and quality
+npm run bench                       # frame time at 1920x1080
+```
+
+Both report the **unmasked GPU string** alongside every measurement. On a
+machine with no GPU, Chromium falls back to SwiftShader and rasterises on the
+CPU; a SwiftShader frame time says something about the shader's instruction
+count and nothing about whether it holds 60fps on real hardware. Set
+`CHROMIUM_PATH` if Playwright's bundled browser is not the one to use.
 
 ## Non-negotiables
 

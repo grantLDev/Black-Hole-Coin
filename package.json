@@ -7,9 +7,12 @@
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
-    "verify": "npm run verify:pda && npm run verify:stats",
+    "verify": "npm run verify:pda && npm run verify:stats && npm run verify:visual-state",
     "verify:pda": "tsx scripts/verify-pda.ts",
-    "verify:stats": "tsx scripts/verify-stats.ts"
+    "verify:stats": "tsx scripts/verify-stats.ts",
+    "capture": "tsx scripts/capture.ts shots",
+    "bench": "tsx scripts/capture.ts bench",
+    "verify:visual-state": "tsx scripts/verify-visual-state.ts"
   },
   "dependencies": {
     "next": "^15.5.4",
@@ -23,6 +26,7 @@
     "@types/react": "^19.1.13",
     "@types/react-dom": "^19.1.9",
     "@types/three": "^0.186.0",
+    "playwright": "^1.63.0",
     "tailwindcss": "^4.1.13",
     "tsx": "^4.23.13",
     "typescript": "^5.9.2"
