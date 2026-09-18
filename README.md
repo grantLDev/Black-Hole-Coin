@@ -621,6 +621,43 @@ CPU; a SwiftShader frame time says something about the shader's instruction
 count and nothing about whether it holds 60fps on real hardware. Set
 `CHROMIUM_PATH` if Playwright's bundled browser is not the one to use.
 
+#### What the cost is actually made of
+
+Measured back to back at a pinned 1920x1080 with the tier locked, on
+`ANGLE (Vulkan 1.3.0 (SwiftShader Device (Subzero)), SwiftShader driver)` —
+**software rasterisation, so the absolute numbers mean nothing for a real GPU.**
+The ratios are the point:
+
+| Tier | Quality | Steps | Median frame | Relative |
+| --- | --- | --- | --- | --- |
+| 0 | high | 300 | 6300 ms | 0.99x |
+| 4 | high | 300 | 6416 ms | 1.01x |
+| 8 | high | 300 | 6633 ms | 1.04x |
+| 11 | high | 300 | 6366 ms | 1.00x |
+| 11 | medium | 180 | 4816 ms | 0.76x |
+| 11 | low | 90 | 2950 ms | 0.46x |
+
+Two things fall out, and both are load-bearing for the quality system:
+
+**Market-cap tier costs nothing.** Tiers 0, 4, 8 and 11 land inside a ±3% band
+— narrower than this machine's run-to-run noise — even though tier 11 has a
+disk nearly 3x the radius of tier 0 and has jets running. The geodesic march is
+the entire cost; disk shading and jet volume integration are rounding errors
+against it. So the visuals can grow freely with market cap without a frame
+budget conversation, and `marchSteps` is the only knob in `quality.ts` that
+meaningfully moves the needle.
+
+**The march scales sub-linearly with its own budget.** 0.60x the steps costs
+0.76x, and 0.30x the steps costs 0.46x. Most rays escape or are captured long
+before they exhaust the budget, so lowering the cap only bites on the rays near
+the photon sphere — which is also exactly where the quality loss shows. On top
+of this the lower tiers render fewer pixels (`renderScale` 0.85 and 0.7), so
+end to end medium is ~0.55x and low ~0.23x of high.
+
+These ratios were what caught a 5.7x jet regression: tier 11 measured 12,350 ms
+against tier 8's 2150 ms, which is not a plausible cost for adding a thin
+volumetric cone to a scene whose disk had just grown for free.
+
 ## Non-negotiables
 
 - No API key, keyed RPC URL, or secret in client code — ever.
