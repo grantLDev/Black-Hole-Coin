@@ -92,19 +92,23 @@ float fbm(vec3 p) {
 `;
 
 /**
- * Display transform: ACES filmic tone map, then the sRGB OETF.
+ * Display transform: ACES filmic tone map, a slight S-curve, then the sRGB OETF.
  *
- * This pass uses a `RawShaderMaterial`, which three.js gives NO injected
- * chunks — `#include <tonemapping_fragment>` and `#include <colorspace_fragment>`
- * simply do not exist here, and `renderer.toneMapping` / `renderer.outputColorSpace`
- * therefore have no effect on this shader. So the transform is written out
- * explicitly below.
+ * Every pass in this project uses a `RawShaderMaterial`, which three.js gives
+ * NO injected chunks — `#include <tonemapping_fragment>` and
+ * `#include <colorspace_fragment>` simply do not exist here, and
+ * `renderer.toneMapping` / `renderer.outputColorSpace` therefore have no
+ * effect. So the transform is written out explicitly below.
  *
- * It is a character-for-character port of three's own `ACESFilmicToneMapping`
- * and `sRGBTransferOETF`, and the renderer is configured to the matching
- * values. That is not redundancy: it means the moment a later pass IS a
- * `ShaderMaterial` (or an `EffectComposer` `OutputPass` lands with the bloom
- * chain), it produces identical pixels to this one.
+ * The ACES and sRGB pieces are a character-for-character port of three's own
+ * `ACESFilmicToneMapping` and `sRGBTransferOETF`, and the renderer is
+ * configured to the matching values.
+ *
+ * This chunk is shared by BOTH display paths, and that sharing is the point.
+ * When the post chain is on, the composite pass owns the transform; when it is
+ * off (the low-quality path), the scene shader applies the identical one
+ * inline. The quality governor can step from one to the other mid-session, and
+ * a viewer must not see the image's contrast jump when it does.
  *
  * Exposure is driven from `renderer.toneMappingExposure` through a uniform, so
  * there is still exactly one place to change it.
@@ -155,5 +159,41 @@ vec3 linearToSrgb(vec3 c) {
  */
 float interleavedGradientNoise(vec2 fragCoord) {
   return fract(52.9829189 * fract(0.06711056 * fragCoord.x + 0.00583715 * fragCoord.y));
+}
+
+/**
+ * Rec.709 relative luminance.
+ *
+ * The coefficients match the sRGB primaries this project encodes to, so a
+ * saturated blue jet is correctly treated as dark and a pale inner disk as
+ * bright. Used on linear radiance for the bloom threshold, and deliberately on
+ * ENCODED values where the composite weights its film grain — see that call.
+ */
+float luminance(vec3 linearColor) {
+  return dot(linearColor, vec3(0.2126, 0.7152, 0.0722));
+}
+
+/**
+ * A slight S-curve, applied in DISPLAY space after the sRGB OETF.
+ *
+ * ACES already has a toe and a shoulder, but its midtones come out flatter
+ * than a photographed frame: the disk's mid-brightness filaments and the dark
+ * sky sit closer together in value than a camera would record them. This
+ * blends a fraction of \`smoothstep\` — which is the gentlest possible S — into
+ * the encoded value, which steepens the middle and leaves both ends alone.
+ *
+ * Deliberately after the OETF, not before it. In linear light the same curve
+ * would spend almost all of its contrast on the top stop and crush everything
+ * below 0.05 linear to black, which is most of this image.
+ *
+ * SCURVE_AMOUNT is small on purpose. At 0.10 a mid-grey 0.5 stays 0.5, 0.25
+ * moves to 0.239 and 0.75 to 0.761 — about a sixth of a stop of extra
+ * contrast in the midtones. It reads as film stock, not as a curves layer.
+ */
+const float SCURVE_AMOUNT = 0.10;
+
+vec3 filmicSCurve(vec3 encoded) {
+  vec3 s = encoded * encoded * (3.0 - 2.0 * encoded);
+  return mix(encoded, s, SCURVE_AMOUNT);
 }
 `;

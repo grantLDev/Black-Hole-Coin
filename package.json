@@ -7,12 +7,14 @@
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
-    "verify": "npm run verify:pda && npm run verify:stats && npm run verify:visual-state",
+    "verify": "npm run verify:pda && npm run verify:stats && npm run verify:visual-state && npm run verify:post",
     "verify:pda": "tsx scripts/verify-pda.ts",
     "verify:stats": "tsx scripts/verify-stats.ts",
     "capture": "tsx scripts/capture.ts shots",
     "bench": "tsx scripts/capture.ts bench",
-    "verify:visual-state": "tsx scripts/verify-visual-state.ts"
+    "verify:visual-state": "tsx scripts/verify-visual-state.ts",
+    "verify:post": "tsx scripts/verify-post.ts",
+    "banding": "tsx scripts/banding.ts"
   },
   "dependencies": {
     "next": "^15.5.4",

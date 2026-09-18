@@ -14,6 +14,12 @@
  * recovers *because* it dropped, it steps back up, and the cycle repeats,
  * which reads as periodic stuttering. Downgrade-only is stable, and matches
  * the ratcheting philosophy of the rest of the site.
+ *
+ * A THIRD LEVER arrived with the post chain: whether there is one. `post` is
+ * false on the bottom tier, and that single flag takes out the full-resolution
+ * half-float scene target, the bloom pyramid and the composite pass together.
+ * It is the largest single step in this file after the march budget, and it is
+ * deliberately all-or-nothing — see the field's own comment.
  */
 
 export type QualityTier = "low" | "medium" | "high";
@@ -59,6 +65,32 @@ export interface QualityProfile {
    * is compiled out entirely. */
   readonly diskFbmOctaves: number;
   /**
+   * Whether the post chain runs at all.
+   *
+   * THIS IS THE SINGLE FLAG the brief asks for. False means the scene shader
+   * tone maps and writes straight to the default framebuffer, and `PostChain`
+   * is never constructed — no half-float scene target, no pyramid, no
+   * composite pass, and none of their bandwidth. It is not a quality setting
+   * with a cheap mode; the chain is either there or it is not.
+   *
+   * False on `low` because the post chain's cost is almost entirely memory
+   * bandwidth, and bandwidth is exactly what a phone that has already been
+   * stepped down to `low` has run out of. A device in that state needs the
+   * frame, not the grade.
+   */
+  readonly post: boolean;
+  /**
+   * Levels in the bloom pyramid, including the half-resolution base.
+   *
+   * Each level costs one downsample and one upsample pass over a quarter of
+   * the previous level's pixels, so the whole chain beyond the base costs
+   * about a third of the base again — cheap, but the WIDTH of the bloom is
+   * what this buys and a wide bloom on a small screen is just a haze. Ignored
+   * when `post` is false, and capped at runtime by how far the drawing buffer
+   * can actually be halved.
+   */
+  readonly bloomLevels: number;
+  /**
    * Frame time above which this tier is considered unsustainable, in ms.
    * `Infinity` on the bottom tier — there is nowhere left to fall.
    */
@@ -79,6 +111,12 @@ export const QUALITY_PROFILES: Readonly<Record<QualityTier, QualityProfile>> = {
     marchStepScale: 0.11,
     marchTurnLimit: 0.055,
     diskFbmOctaves: 3,
+    post: true,
+    // The coarsest of five levels is 1/32 of the frame, so its texels are 32
+    // device pixels across and the tent on top of them reaches roughly 64
+    // pixels out from a bright source. Wider than that stops reading as a lens
+    // and starts reading as fog.
+    bloomLevels: 5,
     // Sustained below 50fps on "high" means "high" is the wrong call.
     downgradeAboveMs: 1000 / 50,
   },
@@ -92,6 +130,11 @@ export const QUALITY_PROFILES: Readonly<Record<QualityTier, QualityProfile>> = {
     marchStepScale: 0.16,
     marchTurnLimit: 0.085,
     diskFbmOctaves: 3,
+    post: true,
+    // One level fewer, which is also one level narrower — appropriate, since
+    // this tier is already rendering under-native and the widest level was
+    // being upscaled to the screen anyway.
+    bloomLevels: 4,
     downgradeAboveMs: 1000 / 38,
   },
   low: {
@@ -104,6 +147,9 @@ export const QUALITY_PROFILES: Readonly<Record<QualityTier, QualityProfile>> = {
     marchStepScale: 0.26,
     marchTurnLimit: 0.15,
     diskFbmOctaves: 2,
+    // The whole stack off. See `post` above.
+    post: false,
+    bloomLevels: 0,
     downgradeAboveMs: Number.POSITIVE_INFINITY,
   },
 } as const;

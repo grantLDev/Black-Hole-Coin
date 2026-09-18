@@ -41,6 +41,24 @@ void main() {
  * host clamps to it. Both exist on purpose: a constant loop bound is what lets
  * the driver schedule registers sanely, and a uniform is what lets the step
  * count be changed without a recompile.
+ *
+ * TWO OUTPUT MODES, selected by the `SCENE_TO_HDR_TARGET` define.
+ *
+ *   0 — direct to the default framebuffer. The shader tone maps, encodes to
+ *       sRGB and dithers itself, and alpha is meaningless. This is the
+ *       low-quality path with the post chain switched off, and it is the exact
+ *       image this project rendered before the post chain existed.
+ *
+ *   1 — to a half-float render target for the post chain. RGB is untouched
+ *       linear radiance and ALPHA carries the emissive luminance, which is the
+ *       bloom mask. No tone map, no sRGB, no dither: doing any of those here
+ *       would mean blooming, aberrating and grading display-encoded values,
+ *       which is the difference between light behaving like light and a filter
+ *       stack smeared over a finished picture.
+ *
+ * The switch is a define rather than a uniform because it changes what the
+ * shader WRITES, and a branch on a uniform would leave the dead tone map in
+ * the instruction stream on the path that costs the most.
  */
 export const SCENE_FRAG = /* glsl */ `
 precision highp float;
@@ -61,7 +79,13 @@ uniform float uTanHalfFov;
 /** Drawing-buffer size in device pixels. */
 uniform vec2 uResolution;
 
-/** Mirrors renderer.toneMappingExposure. */
+/**
+ * Mirrors renderer.toneMappingExposure.
+ *
+ * Only read when SCENE_TO_HDR_TARGET is 0. In the post path the composite pass
+ * owns the display transform and receives the same value, so there is still
+ * one exposure control for the whole renderer.
+ */
 uniform float uExposure;
 
 ${HASH_GLSL}
@@ -82,10 +106,24 @@ void main() {
   vec3 rayDir = normalize(uCameraBasis * vec3(ndc * uTanHalfFov, 1.0));
 
   // The one call that produces the entire image. Disk, photon ring, shadow,
-  // jets, and the lensed sky behind all of it come back in linear HDR.
-  vec3 radiance = traceBlackHole(uCameraPosition, rayDir);
+  // jets, and the lensed sky behind all of it come back in linear HDR, split
+  // into everything and disk-plus-jets-only.
+  TraceResult trace = traceBlackHole(uCameraPosition, rayDir);
 
-  vec3 color = linearToSrgb(acesFilmic(radiance, uExposure));
+#if SCENE_TO_HDR_TARGET
+  // Alpha is the bloom mask: the luminance the disk and the jets contributed,
+  // in the same linear units as RGB. The composite recovers the emissive
+  // COLOUR from it as rgb * (a / luminance(rgb)) — exact whenever one source
+  // dominates the pixel, which is the case everywhere bright enough to bloom,
+  // and gracefully wrong only where a faint star shows through faint gas.
+  //
+  // One channel instead of a second render target on purpose: the alpha of the
+  // scene target is otherwise dead weight (nothing here is transparent), so
+  // the mask is free, where MRT would cost another full-resolution surface and
+  // its bandwidth on every frame.
+  fragColor = vec4(trace.radiance, luminance(trace.emissive));
+#else
+  vec3 color = filmicSCurve(linearToSrgb(acesFilmic(trace.radiance, uExposure)));
 
   // Dither in display space, immediately before the 8-bit framebuffer
   // quantises it. The galactic band and the outer disk are both very dark,
@@ -93,5 +131,6 @@ void main() {
   color += (interleavedGradientNoise(gl_FragCoord.xy) - 0.5) / 255.0;
 
   fragColor = vec4(color, 1.0);
+#endif
 }
 `;

@@ -21,6 +21,13 @@
  * steps down: at most two rebuilds in a session. Everything else — including
  * the march budget `uQualitySteps`, which rides under the `MARCH_STEPS`
  * ceiling — is a uniform and is free to change every frame.
+ *
+ * A fourth define, `SCENE_TO_HDR_TARGET`, chooses what the shader writes:
+ * linear HDR plus a bloom mask for the post chain, or a finished sRGB frame for
+ * the default framebuffer. It is a define for the same reason as the others —
+ * on a uniform, the tone map would still be compiled into the path that cannot
+ * afford it — and it changes at most once in a session, when the governor steps
+ * down to a profile with the post chain off.
  */
 
 import {
@@ -36,6 +43,7 @@ import {
   Vector3,
   type IUniform,
   type WebGLRenderer,
+  type WebGLRenderTarget,
 } from "three";
 
 import type { OrbitCamera } from "./OrbitCamera";
@@ -90,7 +98,7 @@ export class FullscreenPass {
   /** The active `MARCH_STEPS` define; `uQualitySteps` is clamped to it. */
   private marchStepCeiling: number;
 
-  constructor(profile: QualityProfile) {
+  constructor(profile: QualityProfile, hdrOutput: boolean) {
     this.geometry = new BufferGeometry();
     // Clip-space coordinates directly. Vertices at 3 rather than 1 make one
     // triangle that covers the whole viewport after clipping; the attribute is
@@ -128,7 +136,7 @@ export class FullscreenPass {
       vertexShader: SCENE_VERT,
       fragmentShader: SCENE_FRAG,
       uniforms: this.uniforms,
-      defines: definesFor(profile),
+      defines: definesFor(profile, hdrOutput),
       // Nothing occludes anything: there is one primitive and it covers every
       // pixel. The context is created without a depth buffer to match.
       depthTest: false,
@@ -152,9 +160,9 @@ export class FullscreenPass {
    * frame. It is driven by the quality governor, which only ever steps down
    * and therefore fires at most twice in a session.
    */
-  setQuality(profile: QualityProfile): void {
+  setQuality(profile: QualityProfile, hdrOutput: boolean): void {
     const defines = this.material.defines as Record<string, string>;
-    const next = definesFor(profile);
+    const next = definesFor(profile, hdrOutput);
 
     let changed = false;
     for (const key of Object.keys(next)) {
@@ -221,7 +229,16 @@ export class FullscreenPass {
     this.uniforms.uExposure.value = exposure;
   }
 
-  render(renderer: WebGLRenderer): void {
+  /**
+   * Draw the scene into `target`, or into the default framebuffer for null.
+   *
+   * The target must be half float when the pass was built with `hdrOutput`:
+   * the whole point of that mode is that the disk's highlights survive to the
+   * bloom threshold unclipped, and an 8-bit target would flatten every one of
+   * them to 1.0 on the way out of this function.
+   */
+  render(renderer: WebGLRenderer, target: WebGLRenderTarget | null = null): void {
+    renderer.setRenderTarget(target);
     renderer.render(this.scene, this.camera);
   }
 
@@ -243,10 +260,11 @@ export class FullscreenPass {
   }
 }
 
-function definesFor(profile: QualityProfile): Record<string, string> {
+function definesFor(profile: QualityProfile, hdrOutput: boolean): Record<string, string> {
   return {
     SKY_FBM_OCTAVES: String(profile.skyFbmOctaves),
     DISK_FBM_OCTAVES: String(profile.diskFbmOctaves),
     MARCH_STEPS: String(profile.marchSteps),
+    SCENE_TO_HDR_TARGET: hdrOutput ? "1" : "0",
   };
 }

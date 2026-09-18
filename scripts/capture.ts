@@ -9,6 +9,10 @@
  *   npx tsx scripts/capture.ts shots      screenshots across tiers and times
  *   npx tsx scripts/capture.ts bench      frame time at 1920x1080
  *
+ * The banding check is a separate harness — see scripts/banding.ts — because it
+ * measures pixel values rather than looking at them, and needs a frame read back
+ * from the renderer rather than a PNG of the page.
+ *
  * Requires the dev or production server to already be listening on BASE_URL.
  *
  * A NOTE ON THE NUMBERS. On a machine with no GPU, Chromium falls back to
@@ -73,6 +77,15 @@ const SHOTS: readonly Shot[] = [
   { name: "12-low-inclination", query: "tier=11&t=100&quality=high" },
   { name: "08-quality-low", query: "tier=11&t=0&quality=low" },
   { name: "09-quality-medium", query: "tier=11&t=0&quality=medium" },
+  // The post chain, on and off, on the same frame. `13` and `14` are the pair
+  // to compare: everything the post stack does — bloom, aberration, vignette,
+  // grain — is the difference between them, and the low tier's shipped image
+  // is exactly `14`.
+  { name: "13-post-on", query: "tier=11&t=0&quality=high&post=1" },
+  { name: "14-post-off", query: "tier=11&t=0&quality=high&post=0" },
+  // Tier 0 with post on: the quietest the chain ever gets, and where an
+  // overdone bloom or a visible grain would show first.
+  { name: "15-post-tier0", query: "tier=0&t=0&quality=high&post=1" },
   // Above the plane, to confirm the over-and-under wrap is lensing and not a
   // mirrored copy of the disk.
   { name: "10-oblique", query: "tier=11&t=33.4&quality=high" },

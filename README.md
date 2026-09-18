@@ -96,9 +96,14 @@ un-unlock — which the design forbids.
 | `npm run build` | Production build |
 | `npm run start` | Serve the production build |
 | `npm run typecheck` | `tsc --noEmit` |
-| `npm run verify` | Both suites below |
+| `npm run verify` | Every suite below |
 | `npm run verify:pda` | Checks base58, the ed25519 on-curve test and PDA derivation against known pump.fun addresses |
 | `npm run verify:stats` | Checks the bonding curve decoder, the sustain guard, tier monotonicity, the cache and the demo feed |
+| `npm run verify:visual-state` | Checks the tier ratchet, the jet latch and the frame-rate independence of the smoothing |
+| `npm run verify:post` | Checks the post ratchet, the grain ceiling, the aberration scale and the bloom energy normalisation |
+| `npm run capture` | Screenshots across tiers, times and quality paths (needs a running server) |
+| `npm run bench` | Frame time at a pinned 1920x1080 (needs a running server) |
+| `npm run banding` | Measures banding in the dark gradients against an undithered control (needs a running server) |
 
 ## The data layer
 
@@ -330,10 +335,13 @@ matrix anywhere — the image is raymarched per pixel from a ray.
 | `lib/gl/OrbitCamera.ts` | Ray origin + orthonormal basis + FOV |
 | `lib/gl/VisualState.ts` | Tier table → smoothed, ratcheted shader uniforms |
 | `lib/gl/quality.ts` | Quality tiers, device detection, runtime governor |
+| `lib/gl/PostChain.ts` | Bloom pyramid, composite, and the surfaces they need |
 | `lib/gl/shaders/blackhole.glsl.ts` | Geodesic marcher, accretion disk, jets |
+| `lib/gl/shaders/post.glsl.ts` | Bloom prefilter, dual Kawase, composite |
 | `lib/gl/shaders/*.glsl.ts` | GLSL as template literals |
 | `components/RendererMount.tsx` | Attaches the renderer to the server-rendered canvas |
 | `scripts/capture.ts` | Headless screenshot + frame-time harness |
+| `scripts/banding.ts` | Reads frames back and measures banding in the dark gradients |
 
 ### Why these choices
 
@@ -535,6 +543,110 @@ restored from bfcache could each hand the renderer a lower tier than it is
 currently showing. The cheapest place to make a backwards visual impossible is
 the last gate before the GPU.
 
+### The post chain
+
+The raymarch renders into a half-float target instead of the screen, and
+`lib/gl/PostChain.ts` takes it from there:
+
+```
+scene HDR ──prefilter──▶ level 0 ──▶ level 1 ──▶ … ──▶ level n   (dual Kawase down)
+                            ▲           ▲                ▲
+                            └───────────┴────────────────┘       (dual Kawase up,
+                                                                  added in place)
+scene HDR + level 0 ──composite──▶ screen
+```
+
+The composite does, in this order: **radial chromatic aberration**, **bloom
+add**, **vignette** — all four in linear radiance — then **ACES + a slight
+S-curve**, then **film grain**, then **dither**.
+
+**Bloom is masked, not just thresholded.** The scene shader writes the
+disk-and-jet luminance into the alpha channel of the HDR target, so the
+prefilter never sees a star at all. That matters because the brief asks for the
+disk and photon ring to bloom and the stars never to — and no luminance
+threshold can do that, since a star is a near-delta spike that is *brighter*
+than most of the disk. The photon ring lands on the right side of the split for
+free: it is not a drawn feature, it is the disk seen through rays that wound
+around the hole, so it is already in the emissive channel. The Einstein ring of
+lensed *background* stars sits a fraction of a degree away in the same image
+and is correctly excluded. The threshold on top of the mask is high (1.0 in
+linear radiance, with a 0.6 soft knee), so most of the disk's area does not
+bloom either — only the beamed inner limb and the ring.
+
+**Dual Kawase, not a Gaussian.** A separable Gaussian wide enough to be a
+convincing bloom needs a large radius and costs taps in proportion — 66 samples
+per pixel per level for a 33-tap blur. Dual Kawase gets a wider, smoother
+kernel from 5 taps down and 8 taps up by letting the bilinear units do the
+averaging and the pyramid do the widening. The whole chain costs less than one
+level of the Gaussian would. The upsample blends *additively* into the surface
+the downsample already wrote, which is why the pyramid needs one set of targets
+rather than two, and each level is tapered by 0.82 so the widest, least defined
+level is not the loudest. Bloom energy is normalised by the geometric sum of
+those weights, so dropping a pyramid level — from a governor step-down, or a
+short window — does not change how strong the bloom looks.
+
+**Everything tier-driven is lerped and ratcheted.** Bloom strength, chromatic
+aberration and grain come from the tier table through `VisualState`, on the same
+smoothing coefficient as the disk, so an unlock is one event rather than three
+effects arriving on their own schedules. Because they ride the same tier index
+as everything else, the ratchet covers them: there is no path by which the bloom
+dims or the aberration narrows.
+
+| Effect | Tier 0 | Tier 11 | Notes |
+| --- | --- | --- | --- |
+| Bloom strength | 0.25 | 1.5 | Masked to disk + jets, threshold 1.0 linear |
+| Chromatic aberration | 0 px | ~4.9 px | At the corner of a 1920-wide frame; zero at centre |
+| Film grain | 0.0063 | 0.0284 | Display-space amplitude; the brief's ceiling is 0.03 |
+| Vignette | 32% | 32% | Not tier-driven — a lens does not change with market cap |
+
+The aberration grows as r² from the centre and pushes red outward, blue inward,
+which is the sign an uncorrected element gives. Five pixels at the extreme
+corner is roughly a fast wide-angle lens wide open; an order of magnitude more
+is the RGB-split glitch look. Grain is animated, per-device-pixel, weighted
+toward the midtones (`4l(1−l)`, with a floor so the shadows keep some), and 35%
+chromatic because colour film has three emulsion layers with independent grain.
+
+**Not included, deliberately:** no lens flares, no anamorphic streaks, no motion
+blur, no depth of field, no god rays.
+
+**One flag turns it all off.** `QualityProfile.post` is false on the low tier,
+and then `PostChain` is never constructed — no half-float target, no pyramid, no
+composite pass, none of their bandwidth. The scene shader tone maps inline and
+draws straight to the framebuffer (`SCENE_TO_HDR_TARGET 0`), which is the path
+this project shipped before the chain existed. Nothing is conditionally
+half-alive; "disabled" post that still allocates a full-screen half-float target
+has already spent most of what turning it off was meant to save. `?post=0`
+forces the same path by hand on any tier.
+
+The display transform (ACES, the S-curve, the sRGB encode, the dither) lives in
+one shared GLSL chunk used by *both* paths, so the governor stepping from
+`medium` to `low` mid-session does not make the image's contrast jump.
+
+### Banding
+
+Wide, very dark gradients quantised to 8 bits are where post work gives itself
+away, and this frame is nothing but wide dark gradients — the galactic band, the
+outer disk's falloff, and now the vignette, which lays a smooth radial ramp over
+the whole image. So it is measured, by `npm run banding`, rather than eyeballed.
+
+The composite dithers with a **triangular-PDF** dither (±1 LSB, from two
+decorrelated interleaved-gradient samples) rather than a single uniform sample.
+Uniform dither leaves the residual noise *modulated* by where the signal sits
+between two levels, which is itself a faint banding pattern. Both dither samples
+are functions of `gl_FragCoord` alone and never of time, so the pattern is
+locked to the screen — an animated dither on top of animated grain would beat
+against it and crawl.
+
+The check is an experiment, not an assertion. A band is a **plateau in a ramp**:
+a run of one value at least 8 pixels long, not clipped to 0 or 255, whose
+neighbouring runs are exactly one level away. Every dark tile is measured twice
+— as rendered, and again with grain and dither forced to zero — and a tile only
+counts as evidence if the *undithered* control bands. A tile that does not band
+without the dither proves nothing and is reported as inconclusive rather than
+scored. The run also reports how far the noise actually moved the frame, so a
+dither that silently does nothing cannot pass by being identical to its own
+control.
+
 ### Quality tiers
 
 A raymarched fragment shader is almost purely fill-rate bound, so the two
@@ -552,6 +664,8 @@ FBM octave counts and march budget, which arrive in the shader as `#define`s.
 | `skyFbmOctaves` | 5 | 4 | 3 |
 | `renderScale` | 1.0 | 0.85 | 0.7 |
 | `maxPixels` | 2.6M | 1.7M | 1.0M |
+| `post` | on | on | **off** |
+| `bloomLevels` | 5 | 4 | — |
 
 `marchSteps` dominates everything else in this table combined.
 `marchTurnLimit` is the knob that resolves the photon ring — at 0.055 rad a ray
@@ -581,6 +695,7 @@ phone's battery rendering a shader nobody can see.
 | `?tier=9` | Pin a market-cap tier, 0–11. Jets unlock at 9 |
 | `?fov=13` | Vertical field of view in degrees. Narrow values inspect the photon ring |
 | `?steps=140` | Override the march budget, under the compiled ceiling |
+| `?post=0` | Force the whole post chain off (`?post=1` forces it on) |
 | `?bench` | Pin a 1920x1080 buffer, measure frame time, publish `window.__singularityBench` |
 
 They read from the URL rather than `NODE_ENV` because the governor's behaviour

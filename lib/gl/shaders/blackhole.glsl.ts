@@ -1,5 +1,5 @@
 /**
- * The black hole: `vec3 traceBlackHole(vec3 origin, vec3 rayDir)`.
+ * The black hole: `TraceResult traceBlackHole(vec3 origin, vec3 rayDir)`.
  *
  * Everything in the frame that is not background sky is produced here, by
  * integrating null geodesics through a Schwarzschild metric in units where the
@@ -58,6 +58,35 @@
  */
 
 export const BLACKHOLE_GLSL = /* glsl */ `
+/**
+ * What one ray came back with, split by SOURCE rather than by brightness.
+ *
+ * \`radiance\` is the finished pixel. \`emissive\` is the part of it that the disk
+ * and the jets put there — everything accumulated along the geodesic, with the
+ * lensed background sky left out.
+ *
+ * The split exists for the bloom pass and it is the reason the brief's "only
+ * the disk and the photon ring bloom, never the stars" is a structural
+ * guarantee here instead of a threshold that happens to work. A star is a
+ * near-delta spike of radiance: any luminance threshold high enough to reject
+ * the bright ones also rejects most of the disk, and any threshold low enough
+ * to keep the disk turns every star into a soft blob. Neither compromise is
+ * necessary once the shader simply says which photons came from where.
+ *
+ * The photon ring lands on the correct side of the split for free. It is not a
+ * drawn feature — it is the disk, seen through rays that wound around the hole
+ * and struck the same annulus several times — so it is already in
+ * \`emissive\`. The Einstein ring of lensed BACKGROUND stars sits a fraction of
+ * a degree away from it in the same image and is correctly excluded, which no
+ * screen-space threshold could ever manage.
+ */
+struct TraceResult {
+  /** The full pixel in linear HDR: disk, jets, and lensed sky. */
+  vec3 radiance;
+  /** Disk and jets only. Always <= radiance componentwise. */
+  vec3 emissive;
+};
+
 /** Scene time in seconds, wrapped by the host — see Renderer.SHADER_TIME_WRAP. */
 uniform float uTime;
 
@@ -405,7 +434,7 @@ vec3 jetEmission(vec3 p) {
 // The march.
 // ---------------------------------------------------------------------------
 
-vec3 traceBlackHole(vec3 origin, vec3 rayDir) {
+TraceResult traceBlackHole(vec3 origin, vec3 rayDir) {
   vec3 pos = origin;
   vec3 vel = rayDir;
 
@@ -493,17 +522,28 @@ vec3 traceBlackHole(vec3 origin, vec3 rayDir) {
     }
   }
 
-  if (captured) return radiance;
+  // Every early exit below leaves the sky out, so emissive and radiance start
+  // equal and only the escaping branch separates them.
+  TraceResult result;
+  result.emissive = radiance;
+  result.radiance = radiance;
+
+  if (captured) return result;
 
   // Running out of steps means the ray is trapped near the photon sphere in
   // all but pathological cases, so step exhaustion reads as capture. The
   // outbound test is the escape hatch: a ray that is far out and still moving
   // away is background however it got there, and without it a raised camera
   // radius would punch a black disc in the sky.
-  if (!escaped && !(dot(pos, pos) > 64.0 && dot(pos, vel) > 0.0)) return radiance;
+  if (!escaped && !(dot(pos, pos) > 64.0 && dot(pos, vel) > 0.0)) return result;
 
   // Gravitational lensing conserves surface brightness, so the escaped
   // direction is sampled with no extra factor: the sky is simply bent.
-  return radiance + transmittance * sampleSky(normalize(vel));
+  //
+  // This is the ONLY line that adds background to the pixel, which is exactly
+  // why the bloom mask can be trusted: whatever the sky contributes never
+  // touches result.emissive.
+  result.radiance = radiance + transmittance * sampleSky(normalize(vel));
+  return result;
 }
 `;

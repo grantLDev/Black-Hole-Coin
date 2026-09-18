@@ -69,11 +69,27 @@ export interface BenchResult {
   readonly p95FrameMs: number;
   readonly fps: number;
   readonly renderer: string;
+  /** Whether the post chain was running during the measured frames. */
+  readonly post: boolean;
+}
+
+/** One composited frame, read back as tightly packed top-down RGBA rows. */
+export interface CapturedFrame {
+  readonly width: number;
+  readonly height: number;
+  readonly data: Uint8Array;
 }
 
 declare global {
   interface Window {
     __singularityBench?: BenchResult;
+    /**
+     * Present on `?debug` and `?bench` pages only. Null when post is off.
+     *
+     * `noiseScale` of 0 renders the frame without grain or dither, which is
+     * what the banding check measures against.
+     */
+    __singularityCapture?: (noiseScale?: number) => CapturedFrame | null;
   }
 }
 
@@ -85,6 +101,20 @@ function readQuality(params: URLSearchParams): QualityTier | undefined {
 function readNumber(params: URLSearchParams, key: string): number | undefined {
   const value = Number(params.get(key));
   return params.has(key) && Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * `?post=0` / `?post=1`, the brief's single kill switch exposed on the URL.
+ *
+ * A bare `?post` reads as on, which is what anyone typing it by hand means.
+ * Anything else is left undefined so the quality profile decides.
+ */
+function readPost(params: URLSearchParams): boolean | undefined {
+  if (!params.has("post")) return undefined;
+  const value = params.get("post");
+  if (value === null || value === "" || value === "1" || value === "true") return true;
+  if (value === "0" || value === "false") return false;
+  return undefined;
 }
 
 function readTier(params: URLSearchParams): number | undefined {
@@ -122,6 +152,7 @@ export default function RendererMount() {
     //   ?tier=9          pin a market-cap tier, 0..11 (jets unlock at 9)
     //   ?fov=38          vertical field of view in degrees
     //   ?steps=140       override the march budget, under the compiled ceiling
+    //   ?post=0          force the post chain off (?post=1 forces it on)
     //   ?bench           pin a 1920x1080 buffer and measure frame time
     const params = new URLSearchParams(window.location.search);
     const wantDebug = params.has("debug");
@@ -135,6 +166,7 @@ export default function RendererMount() {
         quality: readQuality(params),
         fixedTime: readFixedTime(params),
         tier: readTier(params),
+        post: readPost(params),
         bufferSize: wantBench ? { width: BENCH_WIDTH, height: BENCH_HEIGHT } : undefined,
         // A benchmark that lets the governor step down mid-run is measuring two
         // different shaders and averaging them. Only `?bench` locks the tier;
@@ -156,7 +188,15 @@ export default function RendererMount() {
 
     const stopBench = wantBench ? startBenchmark(renderer, canvas) : undefined;
 
+    // The banding harness in scripts/banding.ts drives this. Exposed only when
+    // the page was asked for a debug or bench run, so a production page has no
+    // handle on the renderer at all.
+    if (wantDebug || wantBench) {
+      window.__singularityCapture = (noiseScale = 1) => renderer.captureFrame(noiseScale);
+    }
+
     return () => {
+      delete window.__singularityCapture;
       stopBench?.();
       renderer.dispose();
     };
@@ -178,6 +218,8 @@ export default function RendererMount() {
       {stats.quality} · dpr {stats.pixelRatio.toFixed(2)} · {stats.marchSteps} steps
       {"\n"}
       {stats.bufferWidth}×{stats.bufferHeight}
+      {"\n"}
+      post {stats.post ? `on · ${stats.bloomLevels} bloom levels` : "off"}
     </pre>
   );
 }
@@ -236,6 +278,7 @@ function startBenchmark(renderer: SingularityRenderer, canvas: HTMLCanvasElement
       p95FrameMs: p95,
       fps: 1000 / median,
       renderer: describeRenderer(canvas),
+      post: renderer.postEnabled,
     };
 
     window.__singularityBench = result;

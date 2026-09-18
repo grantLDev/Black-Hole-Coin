@@ -7,7 +7,7 @@
  * bug rather than a milestone. This class is the low-pass filter between them,
  * and it is the only place in the renderer that knows tiers exist.
  *
- * Two invariants, both one-directional, both load-bearing:
+ * Three invariants, all one-directional, all load-bearing:
  *
  *  1. THE TIER RATCHET. `setTier` never accepts a lower index than it has
  *     already seen. The authoritative ratchet lives in the data layer, against
@@ -19,7 +19,14 @@
  *     walks backwards is the one thing the whole design forbids. The cheapest
  *     place to make that impossible is here, at the last gate before the GPU.
  *
- *  2. THE JET LATCH. Jets fade in over JET_FADE_SECONDS the first time tier 9
+ *  2. THE POST RATCHET, which falls out of the first one. Bloom strength,
+ *     chromatic aberration and grain are read off the same tier index as the
+ *     disk, so the ratchet above covers them at no extra cost: there is no
+ *     path by which the bloom can dim or the aberration narrow. That is the
+ *     whole reason the post chain is fed from here rather than straight from
+ *     the data feed.
+ *
+ *  3. THE JET LATCH. Jets fade in over JET_FADE_SECONDS the first time tier 9
  *     is reached, and `jetUnlocked` then stays true forever. There is no code
  *     path that lowers `jetStrength` once it has begun to rise, including
  *     `setTier(0)`.
@@ -51,7 +58,7 @@ const MAX_STEP_SECONDS = 0.25;
 
 export type Rgb = readonly [number, number, number];
 
-/** Everything the fragment shader needs that is not camera or quality. */
+/** Everything the scene fragment shader needs that is not camera or quality. */
 export interface VisualUniformValues {
   readonly diskOuterRadius: number;
   readonly diskBrightness: number;
@@ -59,6 +66,27 @@ export interface VisualUniformValues {
   readonly diskColorInner: Rgb;
   readonly diskColorOuter: Rgb;
   readonly jetStrength: number;
+}
+
+/**
+ * Everything the post chain's composite pass needs.
+ *
+ * Separate from `VisualUniformValues` because the post chain is optional — on
+ * the low-quality path it does not exist — and because the two are consumed by
+ * different passes. They come from the same tier and the same smoother, so
+ * they can never disagree about which tier is showing.
+ *
+ * Every one of these is lerped, for the same reason the disk radius is: a
+ * bloom that steps from 0.65 to 0.76 in one frame is a flash, and a flash on
+ * an unlock is indistinguishable from a bug.
+ */
+export interface PostUniformValues {
+  /** Bloom intensity. 0.25 at Protostar to 1.5 at Gargantua. */
+  readonly bloomStrength: number;
+  /** Radial RGB split. 0 at Protostar to 0.8 at Gargantua. */
+  readonly chromaticAberration: number;
+  /** Film grain amount. 0.06 at Protostar to 0.27 at Gargantua. */
+  readonly grainAmount: number;
 }
 
 function clampTierIndex(index: number): TierIndex {
@@ -72,6 +100,11 @@ export class VisualState {
   private diskOuterRadius: number;
   private diskBrightness: number;
   private diskTurbulence: number;
+
+  private bloomStrength: number;
+  private chromaticAberration: number;
+  private grainAmount: number;
+
   /** Linear-light, not sRGB. See `hexToLinearRgb`. */
   private readonly diskColorInner: [number, number, number];
   private readonly diskColorOuter: [number, number, number];
@@ -91,6 +124,9 @@ export class VisualState {
     this.diskOuterRadius = tier.diskOuterRadius;
     this.diskBrightness = tier.diskBrightness;
     this.diskTurbulence = tier.diskTurbulence;
+    this.bloomStrength = tier.bloomStrength;
+    this.chromaticAberration = tier.chromaticAberration;
+    this.grainAmount = tier.grainAmount;
     this.diskColorInner = hexToLinearRgb(tier.diskColorInner);
     this.diskColorOuter = hexToLinearRgb(tier.diskColorOuter);
 
@@ -136,6 +172,13 @@ export class VisualState {
     this.diskBrightness += (target.diskBrightness - this.diskBrightness) * k;
     this.diskTurbulence += (target.diskTurbulence - this.diskTurbulence) * k;
 
+    // The post parameters ride the same coefficient as the disk, so an unlock
+    // is one event: the disk widens and the bloom, aberration and grain come
+    // up with it, rather than three effects arriving on their own schedules.
+    this.bloomStrength += (target.bloomStrength - this.bloomStrength) * k;
+    this.chromaticAberration += (target.chromaticAberration - this.chromaticAberration) * k;
+    this.grainAmount += (target.grainAmount - this.grainAmount) * k;
+
     lerpInto(this.diskColorInner, hexToLinearRgb(target.diskColorInner), k);
     lerpInto(this.diskColorOuter, hexToLinearRgb(target.diskColorOuter), k);
 
@@ -157,6 +200,15 @@ export class VisualState {
       // Smoothstep on the linear ramp: the fade eases in and out of its four
       // seconds instead of switching on and off at constant rate.
       jetStrength: smoothstep(this.jetProgress),
+    };
+  }
+
+  /** Current smoothed post-chain values. */
+  readPost(): PostUniformValues {
+    return {
+      bloomStrength: this.bloomStrength,
+      chromaticAberration: this.chromaticAberration,
+      grainAmount: this.grainAmount,
     };
   }
 }
