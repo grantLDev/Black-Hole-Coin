@@ -6,7 +6,10 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "verify": "npm run verify:pda && npm run verify:stats",
+    "verify:pda": "tsx scripts/verify-pda.ts",
+    "verify:stats": "tsx scripts/verify-stats.ts"
   },
   "dependencies": {
     "next": "^15.5.4",
@@ -19,6 +22,7 @@
     "@types/react": "^19.1.13",
     "@types/react-dom": "^19.1.9",
     "tailwindcss": "^4.1.13",
+    "tsx": "^4.23.13",
     "typescript": "^5.9.2"
   }
 }
