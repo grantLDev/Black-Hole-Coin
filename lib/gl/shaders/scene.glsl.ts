@@ -9,6 +9,7 @@
  * vertices instead of six.
  */
 
+import { BLACKHOLE_GLSL } from "./blackhole.glsl";
 import { HASH_GLSL, NOISE_GLSL, TONEMAP_GLSL } from "./common.glsl";
 import { SKY_GLSL } from "./sky.glsl";
 
@@ -34,7 +35,12 @@ void main() {
 /**
  * Ray generation and composite.
  *
- * `SKY_FBM_OCTAVES` arrives as a `#define` from the active quality profile.
+ * `SKY_FBM_OCTAVES`, `DISK_FBM_OCTAVES`, and `MARCH_STEPS` arrive as `#define`s
+ * from the active quality profile. `MARCH_STEPS` is the compile-time CEILING on
+ * the march loop; the runtime budget is the `uQualitySteps` uniform, which the
+ * host clamps to it. Both exist on purpose: a constant loop bound is what lets
+ * the driver schedule registers sanely, and a uniform is what lets the step
+ * count be changed without a recompile.
  */
 export const SCENE_FRAG = /* glsl */ `
 precision highp float;
@@ -43,14 +49,7 @@ precision highp int;
 in vec2 vClip;
 out vec4 fragColor;
 
-/**
- * Ray origin in world space.
- *
- * Unused by the sky, which is infinitely far away and therefore a function of
- * direction alone — it is the raymarched black hole that needs an origin. It
- * is uploaded from today so the camera contract is fixed before anything
- * depends on it.
- */
+/** Ray origin in world space, in Schwarzschild radii. */
 uniform vec3 uCameraPosition;
 
 /** Columns are (right, up, forward). Orthonormal, so no inverse is needed. */
@@ -68,6 +67,7 @@ uniform float uExposure;
 ${HASH_GLSL}
 ${NOISE_GLSL}
 ${SKY_GLSL}
+${BLACKHOLE_GLSL}
 ${TONEMAP_GLSL}
 
 void main() {
@@ -81,14 +81,15 @@ void main() {
   // conventions to get wrong.
   vec3 rayDir = normalize(uCameraBasis * vec3(ndc * uTanHalfFov, 1.0));
 
-  // No black hole yet: every ray escapes.
-  vec3 radiance = sampleSky(rayDir);
+  // The one call that produces the entire image. Disk, photon ring, shadow,
+  // jets, and the lensed sky behind all of it come back in linear HDR.
+  vec3 radiance = traceBlackHole(uCameraPosition, rayDir);
 
   vec3 color = linearToSrgb(acesFilmic(radiance, uExposure));
 
   // Dither in display space, immediately before the 8-bit framebuffer
-  // quantises it. The galactic band is a very dark, very wide gradient and
-  // bands visibly without this.
+  // quantises it. The galactic band and the outer disk are both very dark,
+  // very wide gradients and band visibly without this.
   color += (interleavedGradientNoise(gl_FragCoord.xy) - 0.5) / 255.0;
 
   fragColor = vec4(color, 1.0);

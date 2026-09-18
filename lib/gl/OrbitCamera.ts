@@ -10,6 +10,24 @@
  * The orbit here is temporary scaffolding in the sense that its RADIUS becomes
  * holder-driven later (grows fast, eases back slowly, never below the all-time
  * peak). The basis maths does not change; only where `radius` comes from does.
+ *
+ * THE INCLINATION IS NOT ARBITRARY, AND IT IS NEVER ZERO. The camera is pinned
+ * a few degrees above the disk's equatorial plane, because that framing is the
+ * entire Gargantua look. Seen from near the plane, the far side of the disk is
+ * lensed both OVER and UNDER the shadow, giving the vertical wrap in the
+ * references; seen from 40 degrees up, the same disk reads as an ordinary
+ * tilted ring with a dark hole in it and the lensing stops being legible.
+ * Doppler beaming needs it too — the approaching limb is only dramatically
+ * brighter when the orbital velocity points along the line of sight, which it
+ * does near the plane and does not from above.
+ *
+ * Exactly zero is a DEGENERATE case, not merely an unflattering one, and it is
+ * why the sweep has a bias rather than swinging through the plane. The shader
+ * finds the disk by looking for a sign change in `pos.y` between march steps.
+ * A camera at y = 0 casts equatorial rays whose y stays identically 0 along the
+ * whole geodesic, so those rays never register a crossing and the near side of
+ * the disk — the band that should cut across the front of the shadow — silently
+ * vanishes. The bias keeps every ray off that measure-zero set.
  */
 
 import { Matrix3, Vector3 } from "three";
@@ -22,15 +40,24 @@ const DEG2RAD = Math.PI / 180;
 export interface OrbitCameraOptions {
   /** Distance from the origin, in world units. */
   readonly radius?: number;
-  /** Vertical field of view, in degrees. */
+  /** Vertical field of view, in degrees. Settable at runtime via `setFov`. */
   readonly fovDegrees?: number;
   /** Azimuth rate in rad/s. One revolution takes 2*PI / this. */
   readonly azimuthRate?: number;
+/**
+   * Elevation the sweep is centred on, in radians above the disk plane.
+   *
+   * Must stay clear of zero — see the class comment. Combined with the
+   * amplitude below, the default keeps the camera between about 6 and 12
+   * degrees above the plane.
+   */
+  readonly elevationBias?: number;
   /**
-   * Peak elevation in radians. Sweeping past ~1.2 rad is what actually proves
-   * the sky has no pole: a lat/long star field pinches visibly up there, and a
-   * cube-mapped one shows its face centre. Kept under PI/2 so the basis never
-   * degenerates.
+   * Peak elevation EXCURSION about the bias, in radians.
+   *
+   * Small on purpose: the whole range has to stay inside the band where the
+   * over-and-under lensing and the Doppler asymmetry read. Kept under PI/2 so
+   * the basis never degenerates.
    */
   readonly elevationAmplitude?: number;
   /** Angular frequency of the elevation sweep, in rad/s. */
@@ -48,10 +75,12 @@ export class OrbitCamera {
   readonly position = new Vector3();
   /** Column-major, columns (right, up, forward). Orthonormal. */
   readonly basis = new Matrix3();
-  readonly tanHalfFov: number;
+  /** tan(verticalFov / 2). Mutable: see `setFov`. */
+  tanHalfFov: number;
 
   private readonly radius: number;
   private readonly azimuthRate: number;
+  private readonly elevationBias: number;
   private readonly elevationAmplitude: number;
   private readonly elevationRate: number;
   private readonly rollAmplitude: number;
@@ -62,12 +91,22 @@ export class OrbitCamera {
   private readonly up = new Vector3();
 
   constructor(options: OrbitCameraOptions = {}) {
-    this.radius = options.radius ?? 12;
+    // 17 rs. Two constraints fix this, and the first is hard: the camera must
+    // sit OUTSIDE the disk at every tier, and tier 11 puts the outer edge at
+    // 11.5 rs. Inside it, the marcher is perfectly correct and the picture is
+    // useless — the disk wraps around the viewer and reads as a tunnel.
+    // The second is framing: at a 50-degree fov this puts the ~2.6 rs shadow
+    // at about a third of the frame height and runs the tier-11 disk off both
+    // sides, which is the reference composition. Becomes holder-driven later.
+    this.radius = options.radius ?? 17;
     this.tanHalfFov = Math.tan(((options.fovDegrees ?? 50) * DEG2RAD) / 2);
     // ~180s per revolution. Slow enough that any crawl or twinkle in the star
     // field would be obvious rather than lost in the motion.
     this.azimuthRate = options.azimuthRate ?? 0.035;
-    this.elevationAmplitude = Math.min(options.elevationAmplitude ?? 1.25, 1.45);
+    // ~9 degrees, drifting +-2.6. See the class comment: this is the framing,
+    // not a default, and the bias must never let the sweep reach zero.
+    this.elevationBias = options.elevationBias ?? 0.16;
+    this.elevationAmplitude = Math.min(options.elevationAmplitude ?? 0.045, 1.45);
     this.elevationRate = options.elevationRate ?? 0.047;
     this.rollAmplitude = options.rollAmplitude ?? 0.12;
     this.rollRate = options.rollRate ?? 0.019;
@@ -75,10 +114,25 @@ export class OrbitCamera {
     this.update(0);
   }
 
+  /**
+   * Change the vertical field of view at runtime, in degrees.
+   *
+   * Clamped well away from both ends: at a few degrees the ray directions
+   * across a pixel become so nearly parallel that the photon ring aliases into
+   * single-pixel noise, and past ~150 the projection stretches the corners
+   * past any useful framing.
+   */
+  setFov(degrees: number): void {
+    if (!Number.isFinite(degrees)) return;
+    const clamped = Math.min(Math.max(degrees, 10), 150);
+    this.tanHalfFov = Math.tan((clamped * DEG2RAD) / 2);
+  }
+
   /** Recompute for a wall-clock time in seconds. */
   update(seconds: number): void {
     const azimuth = seconds * this.azimuthRate;
-    const elevation = Math.sin(seconds * this.elevationRate) * this.elevationAmplitude;
+    const elevation =
+      this.elevationBias + Math.sin(seconds * this.elevationRate) * this.elevationAmplitude;
     const roll = Math.sin(seconds * this.rollRate) * this.rollAmplitude;
 
     const cosElevation = Math.cos(elevation);
