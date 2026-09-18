@@ -317,6 +317,112 @@ It deliberately carries no smoothing. The asymmetric damping of the
 holder-driven camera distance belongs in the render loop where it can be
 frame-rate independent; doing it here would tie the easing to the poll interval.
 
+## The render layer
+
+The whole visual is **one fullscreen triangle running one fragment shader**.
+There is no scene graph geometry, no `PerspectiveCamera`, and no projection
+matrix anywhere — the image is raymarched per pixel from a ray.
+
+| File | Role |
+| --- | --- |
+| `lib/gl/Renderer.ts` | WebGL2 context, frame loop, resize, teardown, quality governor |
+| `lib/gl/FullscreenPass.ts` | The triangle, the material, and the uniforms |
+| `lib/gl/OrbitCamera.ts` | Ray origin + orthonormal basis + FOV |
+| `lib/gl/quality.ts` | Quality tiers, device detection, runtime governor |
+| `lib/gl/shaders/*.glsl.ts` | GLSL as template literals |
+| `components/RendererMount.tsx` | Attaches the renderer to the server-rendered canvas |
+
+### Why these choices
+
+**One triangle, not a quad.** A quad is two triangles meeting on the screen
+diagonal, and GPUs shade in 2x2 quads, so every pixel along that diagonal gets
+shaded twice. One oversized triangle clipped to the viewport covers the same
+pixels with none of that waste.
+
+**`RawShaderMaterial`, not `ShaderMaterial`.** three.js injects a prelude of
+matrices, attributes, and colour-management chunks into a `ShaderMaterial`, and
+none of it applies to a raymarcher. Its tone mapping and sRGB chunks are also
+written for GLSL 1 and do not compile under GLSL 3 — in that path three
+declares neither `pc_fragColor` nor `gl_FragColor`. So the pass performs the
+ACES and sRGB transforms itself, as a direct port of three's own functions, and
+the renderer is configured to the matching values so any future
+`ShaderMaterial` or post-processing pass produces identical pixels.
+
+**No antialiasing, no depth buffer, no clear.** MSAA antialiases geometry
+edges; this scene's only edges are off-screen. There is one primitive, so there
+is nothing to occlude. And the triangle writes every pixel of the viewport, so
+a clear is a guaranteed-redundant full-screen write.
+
+**GLSL lives in `.ts` files, not `.glsl` files.** A `.glsl` import needs a
+bundler loader configured identically for Turbopack (`next dev`) and webpack
+(`next build`), or the production build breaks in a way development never
+shows. Template literals need no loader and compose directly.
+
+### The star field
+
+`sampleSky(vec3 dir)` is a pure function of direction — no time, no camera, no
+screen position, no derivatives. That is what makes it rock-solid under camera
+motion: a star does not move between frames, the camera moves and the star is
+wherever that direction says it is. Any time dependence at all, including an
+animated dither, would reintroduce crawling.
+
+Stars sit on a **cube-sphere grid**, not a lat/long grid, which pinches at the
+poles and seams at the wrap. A tangent warp (`atan`) on each face makes grid
+cells carry near-equal solid angle, taking the corner-to-centre density ratio
+from ~5x down to ~1.4x. That warp is also very nearly an *isometry* — the scale
+from face coordinates to radians is exactly PI/4 at a face centre and at every
+edge midpoint, dipping only to 0.943 * PI/4 at the cube corners — so star
+distances are measured in face coordinates and no star's 3D direction is ever
+reconstructed.
+
+Each of the three density octaves samples a **3x3 cell neighbourhood with
+full-cell jitter**. Testing one cell per ray is cheaper, but it forces stars to
+be inset from their cell edges so their falloff cannot be clipped, and that
+dead margin around every cell is immediately legible as a lattice.
+
+The point spread function is sized in **pixels, not radians**, so stars stay the
+same apparent size at every resolution — and never shrink below ~0.8 pixels. A
+sub-pixel star falls between sample points as the camera turns and blinks in and
+out; that, not the hashing, is what makes cheap star fields twinkle.
+
+Hashing uses the "hash without sine" functions rather than
+`fract(sin(dot(p,k))*43758.5453)`. `sin` is implemented at wildly different
+precisions across GPUs, so a sine hash yields a visibly different star field on
+different devices and degenerates into stripes on some mobile drivers.
+
+`sampleSky` returns **linear HDR radiance**, not display colour, and the values
+are tuned against ACES specifically: ACES multiplies small inputs by roughly
+0.1 and clips anything under ~0.0022 linear to black.
+
+### Quality tiers
+
+A raymarched fragment shader is almost purely fill-rate bound, so the two
+levers that matter are how many pixels get shaded and how much work each pixel
+does. Both are in `lib/gl/quality.ts`: `maxPixelRatio`, `renderScale`, a hard
+`maxPixels` ceiling (a 5K display at DPR 2 asks for ~14.7M pixels), and the
+Milky Way FBM octave count, which arrives in the shader as a `#define`.
+
+The governor is **downgrade-only**. A bidirectional one oscillates: it drops a
+tier, the frame budget recovers *because* it dropped, it steps back up, and the
+cycle repeats as periodic stuttering. One-directional is stable, and matches
+the ratcheting philosophy of the rest of the site.
+
+The frame loop is **cancelled outright** when the document is hidden. Browsers
+throttle rAF in a hidden tab rather than stopping it, which still burns a
+phone's battery rendering a shader nobody can see.
+
+### Debug URL parameters
+
+| Parameter | Effect |
+| --- | --- |
+| `?debug` | Frame time, active tier, pixel ratio and buffer size overlay |
+| `?quality=low\|medium\|high` | Pin a tier instead of detecting one |
+| `?t=33.4` | Freeze scene time, to inspect one fixed view |
+
+They read from the URL rather than `NODE_ENV` because the governor's behaviour
+on a real device is exactly what needs inspecting in production. `?t=` is how
+two revisions of the shader get compared pixel for pixel.
+
 ## Non-negotiables
 
 - No API key, keyed RPC URL, or secret in client code — ever.
