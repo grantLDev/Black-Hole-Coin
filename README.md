@@ -485,7 +485,7 @@ near limb reads as solid while the far side glows through it.
 `(cos a, sin a)`, not as the angle — so it is seamless in φ with no tear at
 ±π, and scaling the circle's radius *is* the angular frequency, so the higher
 octaves need no second `sin`/`cos`. It is strongly anisotropic: at r = 4 one
-noise cell spans ~2.5 rs of arc but only ~0.34 rs of radius, so features come
+noise cell spans ~2.4 rs of arc but only ~0.34 rs of radius, so features come
 out ~7x longer than they are wide. Keplerian shear (`ω ∝ r^-1.5`) advects it,
 so the inner bands visibly outrun the outer ones and wind the filaments into
 spirals. Nothing draws a spiral; the shear *is* the spiral.
@@ -513,9 +513,11 @@ lowers `jetStrength` once it has begun to rise, including `setTier(0)`.
   shadow that reads immediately as wrong. 2.2 is still outside the photon
   sphere at 1.5.
 - Radial **brightness** falls as `r^-1.6`, not the Stefan–Boltzmann `r^-3` that
-  `T ∝ r^-0.75` implies. At `r^-3` the outer disk is ~170x dimmer than the
-  inner edge and tone maps to black. The *temperature* profile is left at the
-  physical −0.75, so the colours stay honest.
+  `T ∝ r^-0.75` implies. Across the tier-11 disk (2.2 → 11.5 rs) `r^-3` is a
+  143x falloff and tone maps the outer disk to black; `r^-1.6` is 14x, and once
+  Doppler beaming is included the approaching inner limb still outshines the
+  outer disk by roughly 45x. The *temperature* profile is left at the physical
+  −0.75, so the colours stay honest.
 
 ### Tier uniforms
 
@@ -589,10 +591,18 @@ has a 134s period, so pinning scene time is also how the inclination is varied.
 ### Measuring frame time
 
 `?bench` pins the drawing buffer to exactly 1920x1080 regardless of viewport or
-device pixel ratio, discards two seconds of warm-up, and then times `rAF`
-deltas for six seconds. It times whole frames rather than wrapping the draw
-call: a `gl.finish()` would give a tighter GPU number and a worse answer, since
-it serialises a pipeline that normally overlaps.
+device pixel ratio, **locks the quality tier** so the governor cannot step down
+mid-run and report the average of two different shaders, discards twelve
+warm-up frames, then times 120 `rAF` deltas. It times whole frames rather than
+wrapping the draw call: a `gl.finish()` would give a tighter GPU number and a
+worse answer, since it serialises a pipeline that normally overlaps.
+
+Both the warm-up and the outlier rejection are expressed relative to the run
+rather than in absolute milliseconds. A fixed "skip two seconds, discard frames
+over 250ms" is a hardware assumption in disguise: it is 120 frames and a
+sensible GC filter at 60fps, and it discards *every* frame on a software
+rasteriser — reporting no result rather than a slow one. Warm-up is counted in
+frames, and stalls are rejected at 4x the run's own median.
 
 `scripts/capture.ts` drives the real page in a real browser rather than
 re-implementing the shader in a test rig, because the thing most likely to be

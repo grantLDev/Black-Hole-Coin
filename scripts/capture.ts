@@ -110,6 +110,14 @@ async function waitForFirstFrame(page: Page): Promise<void> {
 async function captureShots(): Promise<void> {
   await mkdir(OUT_DIR, { recursive: true });
 
+  // A full sweep is slow enough on a software rasteriser to be worth
+  // narrowing: SHOTS=photon-ring,low re-takes just the frames a change
+  // actually affects.
+  const filter = process.env.SHOTS?.split(",").map((part) => part.trim()).filter(Boolean);
+  const wanted = filter?.length
+    ? SHOTS.filter((shot) => filter.some((part) => shot.name.includes(part)))
+    : SHOTS;
+
   await withBrowser(async (browser) => {
     const context = await browser.newContext({ viewport: VIEWPORT, deviceScaleFactor: 1 });
     const page = await context.newPage();
@@ -117,7 +125,7 @@ async function captureShots(): Promise<void> {
     const errors: string[] = [];
     await collectErrors(page, errors);
 
-    for (const shot of SHOTS) {
+    for (const shot of wanted) {
       await page.goto(`${BASE_URL}/?debug&${shot.query}`, { waitUntil: "networkidle" });
       await waitForFirstFrame(page);
       const file = path.join(OUT_DIR, `${shot.name}.png`);

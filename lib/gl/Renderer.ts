@@ -85,6 +85,15 @@ export interface RendererOptions {
   /** Forces a starting quality tier, bypassing detection. For debugging. */
   readonly quality?: QualityTier;
   /**
+   * Stop the governor from ever stepping down.
+   *
+   * `quality` alone only picks the STARTING tier — the governor still enforces
+   * the frame budget from there, which is the right behaviour on a real page
+   * and wrong in a measurement: a run that downgrades halfway through reports
+   * the average of two different shaders under one label.
+   */
+  readonly lockQuality?: boolean;
+  /**
    * Pins scene time to a fixed number of seconds instead of advancing it.
    *
    * The orbit then holds still, which is how a specific view gets inspected —
@@ -121,6 +130,7 @@ export class SingularityRenderer {
   private readonly onStats?: (stats: RendererStats) => void;
   private readonly fixedTime: number | null;
   private readonly bufferSize: { readonly width: number; readonly height: number } | null;
+  private readonly lockQuality: boolean;
 
   private rafId: number | null = null;
   /** Timestamp of the previous frame, or null after a start or resume. */
@@ -141,6 +151,7 @@ export class SingularityRenderer {
     this.onStats = options.onStats;
     this.fixedTime = Number.isFinite(options.fixedTime) ? (options.fixedTime as number) : null;
     this.bufferSize = options.bufferSize ?? null;
+    this.lockQuality = options.lockQuality ?? false;
 
     // A canvas can only ever hold one context, and a second getContext() call
     // returns the first one. That is exactly the behaviour we want: React
@@ -286,7 +297,7 @@ export class SingularityRenderer {
     this.visuals.update(deltaSeconds);
 
     this.draw();
-    this.governor.sample(frameMs);
+    if (!this.lockQuality) this.governor.sample(frameMs);
     this.reportStats(now, frameMs);
   };
 

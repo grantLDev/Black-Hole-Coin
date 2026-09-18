@@ -135,9 +135,12 @@ export default function RendererMount() {
         quality: readQuality(params),
         fixedTime: readFixedTime(params),
         tier: readTier(params),
-        // A benchmark that lets the quality governor step down mid-run is
-        // measuring two different shaders and averaging them.
         bufferSize: wantBench ? { width: BENCH_WIDTH, height: BENCH_HEIGHT } : undefined,
+        // A benchmark that lets the governor step down mid-run is measuring two
+        // different shaders and averaging them. Only `?bench` locks the tier;
+        // `?quality=` still picks a starting point and lets the governor work,
+        // because watching it degrade on a real device is the point of pinning.
+        lockQuality: wantBench,
         onStats: wantDebug || wantBench ? setStats : undefined,
       });
     } catch (cause) {

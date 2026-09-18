@@ -118,9 +118,11 @@ const float TRANSMITTANCE_EPSILON = 0.004;
  * Radial emissivity falloff exponent.
  *
  * A Shakura-Sunyaev disk has T ~ r^-0.75, so surface brightness ~ T^4 ~ r^-3.
- * At r^-3 the outer disk is 170x dimmer than the inner edge and tone maps to
- * black, which is not what the references show. 1.6 keeps the outer disk
- * legible as deep orange while the inner ring still outshines it ~45x.
+ * Across the tier-11 disk (2.2 to 11.5 rs) that is a 143x falloff, which tone
+ * maps the outer disk to black — not what the references show. At 1.6 the
+ * falloff is 14x, which keeps the outer disk legible as deep orange while the
+ * inner edge still dominates: once Doppler beaming is included the approaching
+ * inner limb outshines the outer disk by roughly 45x.
  * The TEMPERATURE profile below is left at the physical -0.75 — this softening
  * is applied to brightness only, so the colours stay honest.
  */
@@ -200,7 +202,7 @@ const vec3 JET_HOT = vec3(0.86, 0.95, 1.00);
  * per radian, so multiplying 'unit' by 'ka' IS the angular frequency — no
  * second sin/cos is needed for the higher octaves.
  *
- * Anisotropy is the whole point. At r = 4 one noise cell spans ~2.5 rs of arc
+ * Anisotropy is the whole point. At r = 4 one noise cell spans ~2.4 rs of arc
  * but only ~0.34 rs of radius, so features come out 7x longer than they are
  * wide: streaked gas, not blobs. The radial lacunarity (2.7) is deliberately
  * larger than the angular one (2.1), so the streaks get thinner faster than
