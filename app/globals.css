@@ -1,0 +1,43 @@
+@import "tailwindcss";
+
+@theme {
+  --color-void: #000000;
+  --color-horizon: #05060a;
+  --color-disk: #ffb066;
+}
+
+html,
+body {
+  height: 100%;
+  background-color: #000;
+  color: #fff;
+}
+
+/*
+ * The renderer owns the whole viewport. Nothing scrolls, nothing rubber-bands,
+ * and a two-finger drag on iOS must not bounce the page away from the canvas.
+ */
+html {
+  overscroll-behavior: none;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
+  touch-action: none;
+  -webkit-tap-highlight-color: transparent;
+  font-synthesis-weight: none;
+}
+
+canvas {
+  display: block;
+  touch-action: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+}
