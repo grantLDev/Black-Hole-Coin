@@ -43,6 +43,7 @@ import { PostChain, isPostSupported } from "./PostChain";
 import { VisualState } from "./VisualState";
 import {
   QualityGovernor,
+  bufferPixelsPerScreenPixel,
   detectQualityTier,
   effectivePixelRatio,
   type QualityProfile,
@@ -430,6 +431,10 @@ export class SingularityRenderer {
       this.renderer.setPixelRatio(1);
       this.renderer.setSize(this.bufferSize.width, this.bufferSize.height, false);
       const buffer = this.renderer.getContext();
+      // A pinned buffer is a measurement, not a view: it is shown at whatever
+      // size the page gives it, so there is no supersample factor to speak of
+      // and the star field is sized against the buffer itself.
+      this.pass.setPixelScale(1);
       this.pass.setSize(buffer.drawingBufferWidth, buffer.drawingBufferHeight);
       this.post?.setSize(buffer.drawingBufferWidth, buffer.drawingBufferHeight);
       this.governor.reset();
@@ -440,12 +445,12 @@ export class SingularityRenderer {
     const cssWidth = Math.max(1, rect.width || this.canvas.clientWidth);
     const cssHeight = Math.max(1, rect.height || this.canvas.clientHeight);
 
-    const ratio = effectivePixelRatio(
-      this.governor.current,
-      cssWidth,
-      cssHeight,
-      typeof window === "undefined" ? 1 : window.devicePixelRatio || 1,
-    );
+    const devicePixelRatio = typeof window === "undefined" ? 1 : window.devicePixelRatio || 1;
+    const ratio = effectivePixelRatio(this.governor.current, cssWidth, cssHeight, devicePixelRatio);
+
+    // Tell the star field how much of the buffer the display actually
+    // resolves, before anything is sized against it.
+    this.pass.setPixelScale(bufferPixelsPerScreenPixel(ratio, devicePixelRatio));
 
     this.renderer.setPixelRatio(ratio);
     // updateStyle = false: CSS owns the canvas's layout size. Letting three

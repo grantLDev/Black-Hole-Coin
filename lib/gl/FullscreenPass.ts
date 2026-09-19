@@ -95,6 +95,11 @@ export class FullscreenPass {
   private readonly camera = new Camera();
 
   private bufferHeight = 1;
+  /**
+   * Drawing-buffer pixels per physical screen pixel — 1 unless the buffer is
+   * supersampled. See `bufferPixelsPerScreenPixel` in quality.ts.
+   */
+  private pixelScale = 1;
   /** The active `MARCH_STEPS` define; `uQualitySteps` is clamped to it. */
   private marchStepCeiling: number;
 
@@ -225,6 +230,19 @@ export class FullscreenPass {
     this.refreshPixelAngle();
   }
 
+  /**
+   * How many drawing-buffer pixels cover one physical screen pixel.
+   *
+   * Only the star field reads this, and only to keep its point spread function
+   * the size it looks on screen rather than the size it is in the buffer. The
+   * host supplies it because the buffer alone cannot tell: a 3840-pixel-wide
+   * buffer is native on one display and a 2x supersample on another.
+   */
+  setPixelScale(scale: number): void {
+    this.pixelScale = Math.max(1, scale);
+    this.refreshPixelAngle();
+  }
+
   setExposure(exposure: number): void {
     this.uniforms.uExposure.value = exposure;
   }
@@ -248,15 +266,21 @@ export class FullscreenPass {
   }
 
   /**
-   * Angular size of one drawing-buffer pixel, in radians.
+   * Angular size of one SCREEN pixel, in radians.
    *
-   * The star field sizes its point spread function in PIXELS, not in radians,
+   * The star field sizes its point spread function in pixels, not in radians,
    * so stars stay the same apparent size at every resolution and pixel ratio —
    * and, critically, never shrink below a pixel, which is what makes cheap
    * star fields twinkle.
+   *
+   * The `pixelScale` factor is what keeps that promise once the buffer is
+   * supersampled. Without it a 2x buffer halves every star's apparent size and
+   * hands back the sub-pixel twinkle the sizing rule was written to remove —
+   * raising the resolution would make the sky worse, not better.
    */
   private refreshPixelAngle(): void {
-    this.uniforms.uPixelAngle.value = (2 * this.uniforms.uTanHalfFov.value) / this.bufferHeight;
+    this.uniforms.uPixelAngle.value =
+      ((2 * this.uniforms.uTanHalfFov.value) / this.bufferHeight) * this.pixelScale;
   }
 }
 

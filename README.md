@@ -371,11 +371,11 @@ shows. Template literals need no loader and compose directly.
 
 ### The star field
 
-`sampleSky(vec3 dir)` is a pure function of direction — no time, no camera, no
-screen position, no derivatives. That is what makes it rock-solid under camera
-motion: a star does not move between frames, the camera moves and the star is
-wherever that direction says it is. Any time dependence at all, including an
-animated dither, would reintroduce crawling.
+`sampleSky(vec3 dir, float spread)` is a pure function of its arguments — no
+time, no camera, no screen position, no derivatives. That is what makes it
+rock-solid under camera motion: a star does not move between frames, the camera
+moves and the star is wherever that direction says it is. Any time dependence at
+all, including an animated dither, would reintroduce crawling.
 
 Stars sit on a **cube-sphere grid**, not a lat/long grid, which pinches at the
 poles and seams at the wrap. A tangent warp (`atan`) on each face makes grid
@@ -386,15 +386,47 @@ edge midpoint, dipping only to 0.943 * PI/4 at the cube corners — so star
 distances are measured in face coordinates and no star's 3D direction is ever
 reconstructed.
 
-Each of the three density octaves samples a **3x3 cell neighbourhood with
+**Two density octaves, not three, and nothing below one screen pixel.** There
+used to be a third, finest layer: a haze of pinpricks 0.8 pixels across. A point
+spread function narrower than the thing sampling it is a star that blinks in and
+out as the camera turns, and that fine flicker was the single busiest thing in
+the frame. It was deleted rather than enlarged — three thousand *resolved* stars
+per steradian is a confetti sky, and the Milky Way FBM is already the right tool
+for unresolved starlight. What remains is a middle population and a sparse
+scatter of brighter stars, each about a third less dense than before, none below
+1.2 screen pixels, and with the bright end pulled from magnitude 14 to 8 so a
+bright star reads as a star rather than a lens flare.
+
+**Stars fade out where lensing outruns the sampling rate.** Around the shadow a
+single pixel genuinely covers a huge patch of sky: in the strong-deflection
+limit a ray's impact parameter approaches the critical one as `exp(-α)`, so the
+sky angle per pixel grows as `exp(α)`. Point stars drawn into that region
+sparkle no matter how high the resolution goes, because the field there is below
+the sampling limit *by construction*. The marcher accumulates each ray's total
+deflection for free (`|accel| * dt` is already computed for the step criterion)
+and hands `sampleSky` a `spread` factor; stars are dimmed by `1/spread²` —
+which is just surface-brightness conservation — and gone entirely by 2.6.
+Deflection under 0.35 rad reports no compression at all, so the rest of the sky
+is untouched. The smooth Milky Way is never faded: it has no sampling problem.
+It also makes the most expensive rays in the frame the cheapest to finish.
+
+Each density octave samples a **3x3 cell neighbourhood with
 full-cell jitter**. Testing one cell per ray is cheaper, but it forces stars to
 be inset from their cell edges so their falloff cannot be clipped, and that
 dead margin around every cell is immediately legible as a lattice.
 
-The point spread function is sized in **pixels, not radians**, so stars stay the
-same apparent size at every resolution — and never shrink below ~0.8 pixels. A
-sub-pixel star falls between sample points as the camera turns and blinks in and
-out; that, not the hashing, is what makes cheap star fields twinkle.
+The point spread function is sized in **screen pixels, not radians and not
+drawing-buffer pixels**, so stars stay the same apparent size at every
+resolution — and never shrink below one screen pixel. A sub-pixel star falls
+between sample points as the camera turns and blinks in and out; that, not the
+hashing, is what makes cheap star fields twinkle.
+
+The word *screen* there is load-bearing now that the buffer is supersampled.
+`uPixelAngle` is the angle of one **display** pixel: `FullscreenPass` multiplies
+the buffer's pixel angle by the supersample factor the renderer hands it. Size
+the point spread function against the buffer instead and a 2x buffer halves
+every star, handing back exactly the sub-pixel twinkle the rule exists to
+prevent — raising the resolution would make the sky worse.
 
 Hashing uses the "hash without sine" functions rather than
 `fract(sin(dot(p,k))*43758.5453)`. `sin` is implemented at wildly different
@@ -651,9 +683,10 @@ control.
 
 A raymarched fragment shader is almost purely fill-rate bound, so the two
 levers that matter are how many pixels get shaded and how much work each pixel
-does. Both are in `lib/gl/quality.ts`: `maxPixelRatio`, `renderScale`, a hard
-`maxPixels` ceiling (a 5K display at DPR 2 asks for ~14.7M pixels), and the
-FBM octave counts and march budget, which arrive in the shader as `#define`s.
+does. Both are in `lib/gl/quality.ts`: `minPixelRatio`, `maxPixelRatio`,
+`renderScale`, a hard `maxPixels` ceiling (a 5K display at DPR 2 asks for
+~14.7M pixels), and the FBM octave counts and march budget, which arrive in the
+shader as `#define`s.
 
 | Knob | high | medium | low |
 | --- | --- | --- | --- |
@@ -662,10 +695,32 @@ FBM octave counts and march budget, which arrive in the shader as `#define`s.
 | `marchTurnLimit` | 0.055 | 0.085 | 0.15 |
 | `diskFbmOctaves` | 3 | 3 | 2 |
 | `skyFbmOctaves` | 5 | 4 | 3 |
-| `renderScale` | 1.0 | 0.85 | 0.7 |
-| `maxPixels` | 2.6M | 1.7M | 1.0M |
+| `minPixelRatio` | 2.0 | 1.4 | 1.0 |
+| `maxPixelRatio` | 2.5 | 2.0 | 1.5 |
+| `renderScale` | 1.0 | 1.0 | 0.85 |
+| `maxPixels` | 8.3M | 4.2M | 1.6M |
 | `post` | on | on | **off** |
 | `bloomLevels` | 5 | 4 | — |
+| `downgradeAboveMs` | 25 (40fps) | 33 (30fps) | — |
+
+**`minPixelRatio` is the supersampling knob, and it is why the default view is
+sharp.** A browser at 80% zoom reports `devicePixelRatio` 0.8 while the canvas's
+CSS size grows by 1/0.8, so the drawing buffer ends up larger than the screen
+area it is displayed in and the frame is supersampled. That is a real quality
+difference — the photon ring is a one-pixel feature, and undersampled it renders
+as a dotted, beaded line rather than a continuous arc — and there is no reason
+to make a viewer zoom out to get it. Putting a floor *under* the pixel ratio
+reproduces it deliberately: at 2.0 on a 1x display the buffer is 2x2 device
+pixels per screen pixel and the browser's own filter does the downsample for
+free.
+
+The cost is exact and brutal: a fill-rate-bound shader at 2x is **4x the frame
+time**. That is the trade this project now takes on the top two tiers, which is
+also why `maxPixels` moved with it and why the downgrade thresholds were relaxed
+to 40fps and 30fps — a 50fps trigger against a 4x-heavier frame would step
+almost every laptop straight back down to a softer image within seconds, which
+is the opposite of the point. The bottom tier is deliberately left out of all of
+it: it is the net a struggling phone falls into, and there is nothing below it.
 
 `marchSteps` dominates everything else in this table combined.
 `marchTurnLimit` is the knob that resolves the photon ring — at 0.055 rad a ray
@@ -780,5 +835,10 @@ volumetric cone to a scene whose disk had just grown for free.
   value and flag it in the payload.
 - Nothing that has unlocked ever un-unlocks. Tiers, jets, and cosmetic
   milestones are one-directional.
-- 60fps on a 2020 MacBook Air, 30fps on a mid-range Android phone. The quality
-  tier system is built in, not retrofitted.
+- 60fps on a 2020 MacBook Air, 30fps on a mid-range Android phone — *at the
+  tier the governor settles on*. The top tier deliberately spends 4x the fill
+  rate on supersampling and is allowed to run at 40fps; the governor stepping
+  down is the system working, not a regression. The quality tier system is built
+  in, not retrofitted.
+- Nothing in the sky is smaller than one screen pixel, and nothing sparkles.
+  See `CLAUDE.md`.

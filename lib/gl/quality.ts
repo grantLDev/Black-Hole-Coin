@@ -15,6 +15,14 @@
  * which reads as periodic stuttering. Downgrade-only is stable, and matches
  * the ratcheting philosophy of the rest of the site.
  *
+ * SUPERSAMPLING is a deliberate part of (a): `minPixelRatio` puts a FLOOR
+ * under the pixel ratio, so the drawing buffer is larger than the screen area
+ * it is shown in and the browser downsamples it. That is the same thing a
+ * viewer gets by zooming the page out, and it is the largest single quality
+ * win available here — the photon ring is a one-pixel feature and a 2x buffer
+ * is what resolves it. It is also, exactly, a 4x fill-rate cost, which is why
+ * the pixel ceilings and the governor's thresholds both moved with it.
+ *
  * A THIRD LEVER arrived with the post chain: whether there is one. `post` is
  * false on the bottom tier, and that single flag takes out the full-resolution
  * half-float scene target, the bloom pyramid and the composite pass together.
@@ -28,6 +36,24 @@ export interface QualityProfile {
   readonly tier: QualityTier;
   /** Hard ceiling on `devicePixelRatio`, before `renderScale`. */
   readonly maxPixelRatio: number;
+  /**
+   * FLOOR on the pixel ratio, before `renderScale`. This is the supersampling
+   * knob, and it is the reason the image is sharp on an ordinary 1x display.
+   *
+   * A browser at 80% zoom reports `devicePixelRatio` 0.8 while the canvas's
+   * CSS size grows by 1/0.8, so the drawing buffer ends up larger than the
+   * screen area it is shown in — the frame is supersampled, and every edge in
+   * it (the photon ring above all) resolves visibly better. That is a real
+   * quality difference, not a trick of the zoom, and there is no reason to
+   * make a viewer zoom out to get it.
+   *
+   * Raising the floor above the reported ratio reproduces it deliberately: at
+   * 2.0 on a 1x display the buffer is 2x2 device pixels per screen pixel and
+   * the browser's own filter does the downsample for free. The cost is exact
+   * and brutal — a raymarcher is fill-rate bound, so 2x here is 4x the frame
+   * time — which is what `maxPixels` and the governor are for.
+   */
+  readonly minPixelRatio: number;
   /** Multiplier on the clamped pixel ratio. Below 1 renders under-native. */
   readonly renderScale: number;
   /**
@@ -100,12 +126,21 @@ export interface QualityProfile {
 export const QUALITY_PROFILES: Readonly<Record<QualityTier, QualityProfile>> = {
   high: {
     tier: "high",
-    maxPixelRatio: 2,
+    // 2.5 rather than 2 so a 1x display supersamples 2x AND a DPR-1.5 laptop
+    // still gets some. Above 2.5 the returns are gone: the browser's
+    // downsample filter is a box, and a box filter past 2x is just blur.
+    maxPixelRatio: 2.5,
+    // 2x supersampling on any display that reports less. This is the single
+    // change that makes the default view look like the zoomed-out one.
+    minPixelRatio: 2,
     renderScale: 1,
-    // Comfortably above 1080p (2.07M) and below 1440p at DPR 2. The pixel
-    // budgets all came down when the marcher landed: the sky cost a few dozen
-    // ALU ops per pixel, the geodesic integration costs a few thousand.
-    maxPixels: 2_600_000,
+    // 4x the old 2.6M ceiling, which is what a 2x supersample of a 1080p
+    // viewport actually costs (1920*1080*4 = 8.29M, so a 1080p page lands
+    // just under this and renders at a true 2x). Deliberately chosen over
+    // frame rate: the governor drops the tier when a device cannot hold it,
+    // and a sharp image that occasionally steps down beats a soft one that
+    // never does.
+    maxPixels: 8_300_000,
     skyFbmOctaves: 5,
     marchSteps: 300,
     marchStepScale: 0.11,
@@ -117,14 +152,20 @@ export const QUALITY_PROFILES: Readonly<Record<QualityTier, QualityProfile>> = {
     // pixels out from a bright source. Wider than that stops reading as a lens
     // and starts reading as fog.
     bloomLevels: 5,
-    // Sustained below 50fps on "high" means "high" is the wrong call.
-    downgradeAboveMs: 1000 / 50,
+    // 40fps, not 50. The supersampled buffer costs roughly 4x what the old
+    // one did, so a 50fps trigger would step almost every laptop straight
+    // back down to a softer image within seconds — which is the opposite of
+    // the point. 40fps still reads as smooth on a slow orbit.
+    downgradeAboveMs: 1000 / 40,
   },
   medium: {
     tier: "medium",
     maxPixelRatio: 2,
-    renderScale: 0.85,
-    maxPixels: 1_700_000,
+    // 1.4x, so this tier is still supersampled on a 1x display — the step
+    // down from "high" should cost sharpness, not surrender it.
+    minPixelRatio: 1.4,
+    renderScale: 1,
+    maxPixels: 4_200_000,
     skyFbmOctaves: 4,
     marchSteps: 180,
     marchStepScale: 0.16,
@@ -135,13 +176,20 @@ export const QUALITY_PROFILES: Readonly<Record<QualityTier, QualityProfile>> = {
     // this tier is already rendering under-native and the widest level was
     // being upscaled to the screen anyway.
     bloomLevels: 4,
-    downgradeAboveMs: 1000 / 38,
+    downgradeAboveMs: 1000 / 30,
   },
   low: {
     tier: "low",
     maxPixelRatio: 1.5,
-    renderScale: 0.7,
-    maxPixels: 1_000_000,
+    // No supersampling here, and no under-sampling below native either: the
+    // floor is exactly the display. This tier is the safety net a struggling
+    // phone falls into, and there is nothing below it to fall to further, so
+    // it is the one place in this file where the resolution push stops.
+    minPixelRatio: 1,
+    // 0.85 rather than the old 0.7. A visible sharpening on the bottom tier,
+    // and still under native, which is what keeps this the cheap option.
+    renderScale: 0.85,
+    maxPixels: 1_600_000,
     skyFbmOctaves: 3,
     marchSteps: 90,
     marchStepScale: 0.26,
@@ -165,8 +213,10 @@ export function lowerTier(tier: QualityTier): QualityTier | null {
 /**
  * The effective device pixel ratio for a profile at a given CSS size.
  *
- * Clamps `devicePixelRatio` to the profile ceiling, applies the render scale,
- * then shrinks further if the resulting buffer would blow the pixel budget.
+ * Clamps `devicePixelRatio` into the profile's [`minPixelRatio`,
+ * `maxPixelRatio`] band, applies the render scale, then shrinks further if the
+ * resulting buffer would blow the pixel budget. The FLOOR is the supersampling
+ * knob — see its comment on the interface.
  */
 export function effectivePixelRatio(
   profile: QualityProfile,
@@ -174,7 +224,13 @@ export function effectivePixelRatio(
   cssHeight: number,
   devicePixelRatio: number,
 ): number {
-  const clamped = Math.min(Math.max(devicePixelRatio, 1), profile.maxPixelRatio);
+  // The floor is what supersamples: on a 1x display `devicePixelRatio` is 1
+  // and `minPixelRatio` is what the buffer is actually sized by. On a 2x
+  // display the reported ratio already exceeds it and nothing changes.
+  const clamped = Math.min(
+    Math.max(devicePixelRatio, profile.minPixelRatio),
+    profile.maxPixelRatio,
+  );
   let ratio = clamped * profile.renderScale;
 
   const pixels = cssWidth * cssHeight * ratio * ratio;
@@ -185,6 +241,24 @@ export function effectivePixelRatio(
   // Never go below half-native: past that the aliasing costs more than the
   // frame rate buys.
   return Math.max(0.5, ratio);
+}
+
+/**
+ * How many drawing-buffer pixels there are per PHYSICAL screen pixel, along
+ * one axis. 1 when the buffer matches the display, 2 when it is supersampled
+ * 2x, and never below 1.
+ *
+ * The star field needs this and nothing else does. Its point spread function
+ * is sized in pixels precisely so that no star can be smaller than the thing
+ * that samples it — but once the buffer is supersampled, "a buffer pixel" is
+ * no longer what the viewer sees. A 1.0-buffer-pixel star on a 2x buffer is
+ * half a screen pixel, which is exactly the sub-pixel star the sizing rule
+ * exists to prevent. Multiplying the pixel angle by this factor keeps the
+ * point spread function anchored to the SCREEN, so raising the resolution
+ * makes stars better resolved rather than smaller.
+ */
+export function bufferPixelsPerScreenPixel(ratio: number, devicePixelRatio: number): number {
+  return Math.max(1, ratio / Math.max(1, devicePixelRatio));
 }
 
 /**

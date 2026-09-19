@@ -1,14 +1,26 @@
 /**
- * The procedural sky: `vec3 sampleSky(vec3 dir)`.
+ * The procedural sky: `vec3 sampleSky(vec3 dir, float spread)`.
  *
  * Contract, because everything else in the renderer depends on it:
  *
- *  - It is a pure function of `dir`. No time, no camera, no screen position,
- *    no derivatives. That is what makes the field rock-solid under camera
- *    motion: a star does not "move" between frames, the camera moves and the
- *    star is simply wherever that direction says it is. Any time dependence at
- *    all — an animated twinkle, a time-seeded hash, a temporal dither — would
- *    reintroduce the crawling this is built to avoid.
+ *  - It is a pure function of its arguments. No time, no camera, no screen
+ *    position, no derivatives. That is what makes the field rock-solid under
+ *    camera motion: a star does not "move" between frames, the camera moves
+ *    and the star is simply wherever that direction says it is. Any time
+ *    dependence at all — an animated twinkle, a time-seeded hash, a temporal
+ *    dither — would reintroduce the crawling this is built to avoid.
+ *
+ *  - `spread` is how much the ray's geodesic squeezed the sky into one pixel,
+ *    and it is the ONLY thing here that is not a function of direction alone.
+ *    It is not a look: near the shadow a single pixel genuinely covers a huge
+ *    patch of sky, and drawing point stars into it produces fine sparkle that
+ *    no amount of resolution fixes, because the star field there is below the
+ *    sampling limit by construction. Stars are dimmed by 1/spread^2 and gone
+ *    by spread 2.6; the Milky Way, being smooth, is left alone.
+ *
+ *  - NOTHING in this sky is smaller than one screen pixel. That is the rule
+ *    the tiny-pinprick layer was deleted for, and the reason `uPixelAngle` is
+ *    the angle of a SCREEN pixel rather than a drawing-buffer pixel.
  *
  *  - It returns LINEAR HDR radiance, not display colour. Bright stars come
  *    back at values well above 1.0 and are expected to be tone mapped. The
@@ -16,9 +28,11 @@
  *    inputs by roughly 0.1 and clips anything under ~0.0022 linear to black,
  *    so "dim" here still means a real number, not 0.001.
  *
- *  - It is evaluated ONCE per escaped ray, so it is written to be cheap: three
- *    star layers at one grid cell each, and an FBM that is skipped outright
- *    for the ~60% of the sky the galactic band does not reach.
+ *  - It is evaluated ONCE per escaped ray, so it is written to be cheap: two
+ *    star layers over a 3x3 cell neighbourhood each, an FBM that is skipped
+ *    outright for the ~60% of the sky the galactic band does not reach, and
+ *    both star layers skipped for the strongly lensed rays that were the most
+ *    expensive to trace in the first place.
  *
  * Star placement uses a cube-sphere grid rather than a lat/long grid. Lat/long
  * pinches at the poles and seams at the wrap; the cube-sphere has neither. A
@@ -27,7 +41,12 @@
  */
 
 export const SKY_GLSL = /* glsl */ `
-/** Angular size of one drawing-buffer pixel, in radians. */
+/**
+ * Angular size of one SCREEN pixel, in radians — not one drawing-buffer pixel.
+ * The host divides out any supersampling before sending it, so a sharper
+ * buffer resolves the stars better instead of shrinking them below the size
+ * at which they stop being stable. See FullscreenPass.refreshPixelAngle.
+ */
 uniform float uPixelAngle;
 
 /**
@@ -37,7 +56,7 @@ uniform float uPixelAngle;
 const vec3 GALACTIC_POLE = vec3(0.30999, 0.87996, -0.35998);
 
 /** Faint cold floor so empty sky is deep blue-black rather than dead black. */
-const vec3 SKY_FLOOR = vec3(0.0010, 0.0014, 0.0026);
+const vec3 SKY_FLOOR = vec3(0.0007, 0.0010, 0.0020);
 
 /**
  * Below this the galactic band's contribution tone maps to literally zero, so
@@ -127,12 +146,12 @@ vec3 starLayer(
   vec2 uv, float face,
   float freq, float seed,
   float density,
-  float sizePx, float haloWeight,
+  float pixelAngle, float sizePx, float haloWeight,
   float magLow, float magHigh
 ) {
   // Angular size of one cell, and the point spread radius expressed in cells.
   float cellRadians = (3.14159265 / 4.0) / freq;
-  float sigma = (uPixelAngle * sizePx) / cellRadians;
+  float sigma = (pixelAngle * sizePx) / cellRadians;
   // (6 sigma) squared, with headroom for the per-star size jitter below.
   float cutoff = 36.0 * 1.7 * sigma * sigma;
 
@@ -159,10 +178,12 @@ vec3 starLayer(
       float magnitude = mix(magLow, magHigh, brightness);
 
       // Size is partly coupled to magnitude, because a brighter star really
-      // does spread further. The floor keeps every star above ~0.8 buffer
-      // pixels: a sub-pixel star falls between sample points as the camera
-      // turns and blinks in and out, and that — not the hashing — is what
-      // makes cheap star fields twinkle.
+      // does spread further. The floor keeps every star above ONE SCREEN
+      // pixel — see the sizes at the call sites, none of which is below 1.2.
+      // A sub-pixel star falls between sample points as the camera turns and
+      // blinks in and out, and that — not the hashing — is what makes cheap
+      // star fields twinkle. Nothing in this sky is allowed to be that small
+      // any more; the layer that used to be is gone entirely.
       float s = sigma * (0.88 + 0.30 * r.z + 0.26 * brightness);
       float x2 = d2 / (s * s);
 
@@ -200,10 +221,22 @@ vec3 milkyWay(vec3 dir, float band) {
   // reddened. Both far off saturated: this is atmosphere, not a feature.
   vec3 tint = mix(vec3(0.96, 0.84, 0.69), vec3(0.70, 0.78, 0.96), smoothstep(0.30, 0.80, clouds));
 
-  return tint * glow * 0.036;
+  return tint * glow * 0.030;
 }
 
-vec3 sampleSky(vec3 dir) {
+/**
+ * Below this lensing compression the star field is drawn unattenuated, above
+ * it there are no stars at all. See sampleSky's 'spread' argument.
+ *
+ * 2.6 is where a star's own contribution has already fallen to 1/2.6^2 = 15%
+ * of nominal, so the cutoff removes almost nothing that was still visible —
+ * it exists to stop the point spread function from being stretched so far
+ * that the 3x3 cell neighbourhood no longer contains it.
+ */
+const float LENS_STARS_FULL = 1.35;
+const float LENS_STARS_NONE = 2.60;
+
+vec3 sampleSky(vec3 dir, float spread) {
   vec2 uv;
   float face;
   skyFace(dir, uv, face);
@@ -213,18 +246,61 @@ vec3 sampleSky(vec3 dir) {
   float band = galacticBand(dir);
   if (band > SKY_BAND_CUTOFF) color += milkyWay(dir, band);
 
-  // Three octaves. Frequency falls while size and brightness rise, so the
-  // layers read as distance: a haze of faint pinpricks, a middle population,
-  // and a sparse scatter of large bright stars in front of them.
+  // How much sky one screen pixel covers, in units of the unlensed pixel.
+  // Exactly 1 over the great majority of the frame, and large only for the
+  // rays that came close enough to wind around the hole — see LENS_FREE.
+  float compression = max(spread, 1.0);
+
+  // Surface brightness is what a pixel measures, so a star whose FIELD has
+  // been squeezed by 'compression' in each direction contributes 1/compression^2
+  // of the light it would unlensed — the same number of photons spread over
+  // that many more stars per pixel. Without this the region just outside the
+  // shadow shows a whole sky's worth of stars crammed into a few pixels, and
+  // since the camera is always turning, each of those pixels lands on a
+  // different star every frame. That is the fine sparkle around the middle of
+  // the frame, and it is the one place in this scene where the star field
+  // cannot be sampled honestly at any resolution.
+  float lensFade =
+    (1.0 - smoothstep(LENS_STARS_FULL, LENS_STARS_NONE, compression)) / (compression * compression);
+
+  // Below this the layers would tone map to black anyway, and skipping them
+  // makes the most expensive rays in the frame — the ones that wrapped the
+  // photon sphere — the cheapest to finish.
+  if (lensFade < 0.004) return color;
+
+  // The point spread function is widened by the same factor it is dimmed by,
+  // which is what keeps a lensed star the size it looks on SCREEN rather than
+  // collapsing to a sub-pixel spike. Capped by LENS_STARS_NONE, above which
+  // there is nothing left to draw.
+  float pixelAngle = uPixelAngle * compression;
+
+  // TWO octaves, not three. The old first layer was a haze of pinpricks at
+  // 0.8 pixels across, and a point spread function narrower than the thing
+  // sampling it is a star that blinks in and out as the camera turns — the
+  // "sparkle" this sky is now explicitly free of. It was removed rather than
+  // enlarged: three thousand stars per steradian at a size you can actually
+  // resolve is a busy sky, and the Milky Way FBM is already the right tool
+  // for unresolved starlight.
+  //
+  // What is left reads as distance: a middle population, and a sparse scatter
+  // of larger bright stars in front of them. Both are about a third less dense
+  // than they were, and neither is allowed below 1.2 screen pixels.
   //
   // Density is raised inside the galactic band, which is what actually sells a
   // Milky Way — the band is mostly unresolved starlight, not a painted smear.
   // The boost is evaluated at the RAY's direction rather than each star's,
   // which is safe because band() varies over tens of degrees while a star
   // spans a thousandth of one.
-  color += starLayer(uv, face, 64.0,  0.0, 0.130 * (1.0 + 2.20 * band), 0.80, 0.00, 0.05,  0.45);
-  color += starLayer(uv, face, 27.0, 37.0, 0.150 * (1.0 + 1.10 * band), 0.95, 0.05, 0.15,  2.60);
-  color += starLayer(uv, face, 11.0, 91.0, 0.130 * (1.0 + 0.40 * band), 1.20, 0.16, 0.80, 14.00);
+  // The bright end came down with the density. A magnitude-14 star saturates
+  // to white across several pixels and keeps a visible halo for several more,
+  // which reads as a lens flare rather than a star — and with the pinprick
+  // layer gone there is nothing left to hide behind it. At 8 the core is
+  // still unmistakably a bright star and the halo has stopped announcing
+  // itself.
+  color += lensFade *
+    starLayer(uv, face, 27.0, 37.0, 0.105 * (1.0 + 1.10 * band), pixelAngle, 1.20, 0.05, 0.15, 2.10);
+  color += lensFade *
+    starLayer(uv, face, 11.0, 91.0, 0.091 * (1.0 + 0.40 * band), pixelAngle, 1.45, 0.08, 0.80, 8.00);
 
   return color;
 }

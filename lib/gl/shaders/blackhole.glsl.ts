@@ -139,6 +139,12 @@ const float MARCH_MIN_STEP = 0.003;
 /** Below this, everything behind is occluded and the march can stop. */
 const float TRANSMITTANCE_EPSILON = 0.004;
 
+/**
+ * Deflection, in radians, below which a ray is treated as having left the sky
+ * behind it undistorted. See the spread calculation at the end of the march.
+ */
+const float LENS_STARS_FREE = 0.35;
+
 // ---------------------------------------------------------------------------
 // Disk constants.
 // ---------------------------------------------------------------------------
@@ -446,6 +452,12 @@ TraceResult traceBlackHole(vec3 origin, vec3 rayDir) {
   vec3 radiance = vec3(0.0);
   float transmittance = 1.0;
 
+  // Total trajectory turning, in radians, accumulated along the geodesic.
+  // |vel| stays within a percent of 1 by construction, so |accel| * dt IS the
+  // angle turned by that step, and the sum is the ray's deflection angle.
+  // Free: |accel| is already computed for the step criterion.
+  float deflection = 0.0;
+
   float escape2 = uEscapeRadius * uEscapeRadius;
   bool captured = false;
   bool escaped = false;
@@ -498,6 +510,7 @@ TraceResult traceBlackHole(vec3 origin, vec3 rayDir) {
     vec3 previous = pos;
     vel += accel * dt;
     pos += vel * dt;
+    deflection += accelMagnitude * dt;
 
     // Equatorial crossing by sign change in y, interpolated to the exact
     // plane. This does NOT stop at the first hit: a strongly lensed ray dives
@@ -540,10 +553,35 @@ TraceResult traceBlackHole(vec3 origin, vec3 rayDir) {
   // Gravitational lensing conserves surface brightness, so the escaped
   // direction is sampled with no extra factor: the sky is simply bent.
   //
+  // It does NOT conserve angular scale, and that is what the second argument
+  // carries. In the strong-deflection limit a ray's impact parameter
+  // approaches the critical one as exp(-deflection), so the sky angle covered
+  // by one pixel grows as exp(deflection): at the Einstein ring a pixel is
+  // looking at a patch of sky tens of times wider than the star field can be
+  // sampled at, and point stars drawn into it sparkle as the camera turns.
+  // sampleSky dims and then drops them on exactly that measure, which is why
+  // the region around the shadow is smooth and dark rather than busy — and
+  // why it costs less to shade than it used to.
+  //
+  // exp(deflection) is the STRONG-field relation and it is wrong in the weak
+  // field, where the true compression tends to 1 while exp() keeps climbing:
+  // a ray through the corner of a 50-degree frame still bends about 0.2 rad,
+  // and taking that literally would dim the whole sky by a third for no
+  // physical reason. LENS_STARS_FREE is the deflection below which the sky is
+  // reported as uncompressed, which covers everything outside a thin annulus
+  // around the shadow. Above it the exponential takes over quickly — the fade
+  // runs out by about 1.3 rad of bending, so it is the Einstein ring and its
+  // immediate surroundings that lose their stars, and nothing else.
+  //
+  // The exponent is clamped before it leaves: a ray that wrapped the photon
+  // sphere twice has a deflection past 4*PI, and exp() of that is not a number
+  // worth carrying into a multiply.
+  float spread = exp(clamp(deflection - LENS_STARS_FREE, 0.0, 6.0));
+
   // This is the ONLY line that adds background to the pixel, which is exactly
   // why the bloom mask can be trusted: whatever the sky contributes never
   // touches result.emissive.
-  result.radiance = radiance + transmittance * sampleSky(normalize(vel));
+  result.radiance = radiance + transmittance * sampleSky(normalize(vel), spread);
   return result;
 }
 `;
