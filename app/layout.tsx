@@ -44,9 +44,16 @@ export const viewport: Viewport = {
 export default function RootLayout({
   children,
 }: Readonly<{ children: React.ReactNode }>) {
+  // suppressHydrationWarning: extensions that rewrite the page before React
+  // loads (Dark Reader and friends) add attributes to <html> and <body>, which
+  // React then reports as a hydration mismatch it cannot patch up. The flag is
+  // one level deep -- it silences the attribute diff on these two elements and
+  // nothing inside them, so a real mismatch in the app still surfaces.
   return (
-    <html lang="en" className="bg-black">
-      <body className="bg-black text-white antialiased">{children}</body>
+    <html lang="en" className="bg-black" suppressHydrationWarning>
+      <body className="bg-black text-white antialiased" suppressHydrationWarning>
+        {children}
+      </body>
     </html>
   );
 }
