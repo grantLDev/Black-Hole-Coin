@@ -1,4 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
 <!--
+  The root <svg> tag is deliberately the FIRST thing in this file, and the
+  commentary that used to sit above it now lives inside the element. That is
+  not style. Next's metadata image loader sizes this file with `image-size`,
+  whose SVG detector only scans the first 1000 BYTES for the opening tag; if
+  the tag ends past that offset the file is rejected with "is not a valid
+  image file. The image may be corrupted or an unsupported format." With the
+  comment on top the tag ended at byte 987 — twelve bytes of headroom, which a
+  CRLF checkout on Windows spends immediately (seventeen line endings, tag ends
+  at 1003) and the dev server fails to build. Anchored at byte 0 the margin is
+  the whole window and the line-ending style stops mattering. Do not move a
+  comment, an XML declaration or a DOCTYPE above this tag.
+
   The site icon. Picked up automatically by the App Router, which serves it at
   /icon.svg and injects the <link rel="icon"> that stops browsers falling back
   to a /favicon.ico this project does not have.
@@ -14,7 +27,6 @@
   The gradient's white point sits at 26% rather than the centre because the
   disk's approaching limb is Doppler-beamed, exactly as in the shader.
 -->
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
   <defs>
     <linearGradient id="d" x1="0" y1="0" x2="1" y2="0">
       <stop offset="0" stop-color="#e88a3a"/>
