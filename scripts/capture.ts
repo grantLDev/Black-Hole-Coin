@@ -161,7 +161,12 @@ async function withBrowser<T>(run: (browser: Browser) => Promise<T>): Promise<T>
  * overlay to report a frame is the signal that both happened.
  */
 async function waitForFirstFrame(page: Page): Promise<void> {
-  await page.waitForSelector("pre", { timeout: 60_000 });
+  // Generous, for the same reason the screenshot timeout is. The overlay needs
+  // two frames to appear — the first is not integrated, because its delta
+  // spans however long the page took to load — and a 3840x2160 buffer at 300
+  // march steps is upwards of twenty seconds a frame on SwiftShader. A minute
+  // is not a safety margin there, it is a coin toss.
+  await page.waitForSelector("pre", { timeout: 240_000 });
   await page.waitForTimeout(1200);
 }
 
