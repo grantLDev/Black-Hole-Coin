@@ -101,6 +101,7 @@ un-unlock — which the design forbids.
 | `npm run verify:stats` | Checks the bonding curve decoder, the sustain guard, tier monotonicity, the cache and the demo feed |
 | `npm run verify:visual-state` | Checks the tier ratchet, the jet latch and the frame-rate independence of the smoothing |
 | `npm run verify:post` | Checks the post ratchet, the grain ceiling, the aberration scale and the bloom energy normalisation |
+| `npm run verify:feed` | Checks the holder mapping, the asymmetric spring, the peak floor, the promotion queue, the tier-up timeline and the degraded freeze |
 | `npm run capture` | Screenshots across tiers, times and quality paths (needs a running server) |
 | `npm run bench` | Frame time at a pinned 1920x1080 (needs a running server) |
 | `npm run banding` | Measures banding in the dark gradients against an undithered control (needs a running server) |
@@ -321,6 +322,11 @@ from the *end* of the last one, so a slow response can never stack requests.
 It deliberately carries no smoothing. The asymmetric damping of the
 holder-driven camera distance belongs in the render loop where it can be
 frame-rate independent; doing it here would tie the easing to the poll interval.
+
+`components/RendererMount.tsx` hands every payload straight to
+`renderer.applyStats()` without interpreting it. What a payload is allowed to
+change is decided one layer down, in `SceneDirector` — see
+[Binding the feed](#binding-the-feed).
 
 ## The render layer
 
@@ -564,9 +570,24 @@ lowers `jetStrength` once it has begun to rise, including `setTier(0)`.
 `lib/gl/VisualState.ts` is the only part of the renderer that knows tiers
 exist. The tier table holds step values — a tier is a discrete achievement —
 and the shader needs continuous ones, so this is the low-pass filter between
-them. Interpolation is exponential smoothing with a frame-rate-independent
-coefficient, `1 − exp(−dt/τ)`; the naive `x += (target − x) · k` form converges
-at a speed that depends on frame rate.
+them.
+
+Interpolation is a **fixed-duration ease-in-out over 4 seconds**, not
+exponential smoothing. An exponential never actually arrives: it has a
+half-life, not a completion time, which is fine for a filter and wrong for
+choreography. The tier-up event below has cues at 0.3s, 0.5s, 0.8s and 1.5s,
+and those cues only mean anything if the move underneath them has a known
+length. Progress advances by `dt / 4`, so a 30fps phone and a 120fps laptop
+pass through the same value at the same wall-clock instant rather than merely
+converging to the same place eventually.
+
+Every scalar in the tier row rides the same eased `k` — disk radius,
+brightness, turbulence, the two colours, bloom, aberration, grain, camera shake
+and the drone parameters — so an unlock is one event rather than nine effects
+on nine schedules. The drone values are interpolated here even though nothing
+consumes them yet, because an audio engine that re-derived its own transition
+from the raw feed would slide between tiers on a different curve from the
+picture.
 
 It keeps its **own tier ratchet**, refusing any index lower than one it has
 already seen. The authoritative ratchet lives in the data layer against the
@@ -574,6 +595,141 @@ KV-persisted ATH, but a stale poll, a degraded last-known-good value, or a tab
 restored from bfcache could each hand the renderer a lower tier than it is
 currently showing. The cheapest place to make a backwards visual impossible is
 the last gate before the GPU.
+
+### Binding the feed
+
+`lib/gl/SceneDirector.ts` is where `/api/stats` meets the picture. It owns
+`VisualState` (tier easing), `HolderDistance` (the camera spring) and
+`TierEventQueue` (the choreography), and it exists so the frame loop never has
+to know about any of them. The two channels behave differently on purpose, and
+keeping them apart is most of what this file does.
+
+**Market cap → tier. Discrete, ratcheted, permanent.** The index arrives
+already peak-derived from the server and is *never* recomputed from live market
+cap on the client. `TierEventQueue` walks it upward one promotion at a time;
+`VisualState` eases the uniforms; neither accepts a lower index than it has
+already seen. There is no demotion path in the file, the directory, or the
+project.
+
+**Holders → camera distance. Continuous, live, asymmetric, floored.** The only
+input that moves in both directions, and even it cannot walk all the way back.
+
+#### The holder channel
+
+| Rule | Value | Why |
+| --- | --- | --- |
+| Mapping | log, 0 holders → 22 rs, 100k → 5.5 rs | The interesting range of a launch is the first few thousand holders. Linear puts every one of those within 3% of the far end; log puts 1000 holders two thirds of the way in |
+| Rising | 2.5s time constant | Responsive. The hole breathes in |
+| Falling | 60s time constant | A sell-off reads as the hole relaxing, never as a collapse |
+| Floor | `distanceAtPeak × 1.15` | The hole can never look smaller than ~87% of its all-time-peak size |
+| Disk radius | `tierRadius × lerp(0.70, 1.00, growth)` | Tier is the ceiling, holders are how much of it is claimed |
+
+The spring is **critically damped and second order**, solved analytically
+(`x(t) = target + (A + Bt)e^(−ωt)`) rather than integrated numerically. First-
+order smoothing lags a moving target permanently and by an amount proportional
+to its rate; a second-order spring carries velocity and catches up. Critically
+damped is exactly the no-overshoot, no-oscillation case — a hole that sailed
+past its target and came back would read as a glitch. The analytic step is
+exact for any `dt`, so 30fps and 240fps agree to float noise, and a long frame
+cannot make it unstable.
+
+The floor is applied to the **target**, not to the spring's output. Clamping
+the output would leave the spring integrating toward a value it is not allowed
+to reach, parking a permanent velocity against the clamp and making the hole
+twitch whenever the holder count wobbled.
+
+#### The clearance clamp
+
+The one place the brief's two tables genuinely conflict, and the only rule in
+the renderer that overrides a number the brief gives directly. The holder
+mapping bottoms out at 5.5 rs; the tier-11 disk runs out to 11.5 rs. At the top
+of both tables the camera would sit inside its own accretion disk, which the
+marcher renders perfectly correctly as a useless picture — a tunnel, with the
+shadow it exists to frame somewhere behind the viewer.
+
+So the composed distance is floored at `diskOuterRadius × 1.35`. At tier 0 that
+floor is 5.4 rs, *below* the mapping's own minimum, so it never engages and the
+brief's 22 → 5.5 runs end to end. It tightens as the disk grows, which is the
+direction that makes physical sense: a bigger hole cannot be approached as
+closely without swallowing the frame. Holders still roughly double the hole's
+apparent size at every tier — `verify:feed` asserts both halves of that.
+
+#### The tier-up event
+
+Six seconds of choreography, fired once per promotion and never overlapping
+another. Written as a timeline of pure functions of one clock rather than a set
+of stateful tweens, so it can be evaluated at an arbitrary instant — which is
+what makes it testable and what `?event=` pins for a screenshot.
+
+| At | Cue |
+| --- | --- |
+| 0.0s | A radial gravitational-wave packet sweeps inward across the frame, 0.4s |
+| 0.3s | Disk brightness overshoots to 1.6× and settles |
+| 0.5s | The camera pushes in 6% and eases back out |
+| 0.8s | Tier name and threshold fade up, hold 3s, fade down (gone at 5.0s) |
+| 1.5s | Every transient above has finished |
+| 6.0s | The slot frees and the next queued promotion starts |
+
+The six-second slot is longer than anything in it because it is the non-overlap
+guarantee, not a duration: the card is still fading at 5.0s, and a second
+ripple landing on it would read as one confused event rather than two
+milestones.
+
+**Promotions queue and are walked one at a time.** A token that goes from $9k
+to $260k between two five-second polls has crossed seven thresholds and the
+server hands over `tierIndex: 7` in a single payload. Playing one event and
+jumping seven tiers throws away six milestones; playing seven at once is a
+strobe. The queue plays them in order, six seconds apart, with the tier values
+easing one step at a time underneath.
+
+The **first payload of a session adopts its tier silently**. A page load is not
+an unlock: someone arriving at a site already at tier 7 has not just earned
+tier 7, and playing seven events at them would be a lie told in a very
+expensive way.
+
+The ripple is applied to the **ray direction** in the scene shader, not as a
+screen-space UV warp in the post chain. Three reasons: the post chain does not
+exist on the low quality tier and a milestone invisible on a phone is not a
+milestone; warping the finished frame stretches the bloom and grain with it,
+which reads as the monitor flexing rather than as spacetime doing it; and
+bending rays is what a passing wave does, so the lensed sky, the photon ring
+and the disk all distort together because they are all downstream of the same
+bent geodesic. It costs a handful of ALU behind a uniform branch that is false
+on every frame outside those 0.4 seconds.
+
+#### Degraded means frozen
+
+When `stats.degraded` is true, every target keeps its last known value: no new
+holder target, no promotion queued, no event fired, and the quiet
+`HOLDING LAST KNOWN` indicator appears in the HUD. Springs and eases already in
+flight continue to their existing targets rather than being stopped dead —
+halting an integrator mid-move is itself a visible discontinuity, and the point
+of freezing is that bad data changes *nothing*, not that it causes a stop.
+
+A payload is either trusted or it is not. Taking the holder count from a
+flagged payload while ignoring its tier would be a half-trusted payload, which
+is the worst of both.
+
+The single exception is a session whose *first* payload is already degraded.
+There is no last known value to hold, refusing to render would be worse than
+rendering flagged numbers, so it seeds the session and the HUD says so. That is
+not fabricating data; it is using the only data there is and admitting it.
+
+### The HUD
+
+Two elements, both silent most of the time: the tier announcement and the
+degraded indicator. The site is a black hole and the black hole is the content;
+anything permanently on top of it is competing with it.
+
+The announcement's timing is **not** a CSS animation or a `setTimeout`. Both
+run on wall-clock time: they keep going when the renderer stalls, when the tab
+is hidden and the frame loop is cancelled outright, and they have no idea the
+event they belong to was paused. The card reads `TierEventQueue`'s clock
+through a `requestAnimationFrame` loop that writes `style.opacity` on a ref, so
+the card, the ripple and the camera push are always on the same timeline. It
+writes the style directly rather than calling `setState`, because a 60Hz React
+render for one CSS property is a reconciliation per frame to produce one
+mutation.
 
 ### The post chain
 
@@ -751,12 +907,31 @@ phone's battery rendering a shader nobody can see.
 | `?fov=13` | Vertical field of view in degrees. Narrow values inspect the photon ring |
 | `?steps=140` | Override the march budget, under the compiled ceiling |
 | `?post=0` | Force the whole post chain off (`?post=1` forces it on) |
+| `?holders=2500` | Pin the live holder count, which drives the orbit radius |
+| `?peak=9000` | Pin the all-time-peak holder count, i.e. the distance floor |
+| `?promote=6` | Fire a real tier-up choreography, queued up to tier 6 |
+| `?event=0.27` | Freeze the active choreography at 0.27s, for a reproducible still |
+| `?feed=0` | Never poll `/api/stats`, so the frame is a pure function of its URL |
 | `?bench` | Pin a 1920x1080 buffer, measure frame time, publish `window.__singularityBench` |
 
 They read from the URL rather than `NODE_ENV` because the governor's behaviour
 on a real device is exactly what needs inspecting in production. `?t=` is how
 two revisions of the shader get compared pixel for pixel — the elevation sweep
 has a 134s period, so pinning scene time is also how the inclination is varied.
+
+`?feed=0` is what makes a capture reproducible now that the camera is
+holder-driven: a live payload landing between the warm-up frames and the
+shutter would move the camera or fire a promotion, and the resulting image
+would differ from its reference for reasons unrelated to the change under
+review. `scripts/capture.ts` appends it, plus a pinned holder count, to every
+shot. `?event=` is the only way to photograph a 0.4-second ripple on purpose —
+the wavefront starts just beyond the frame corner and reaches the centre at
+0.34s, so 0.08s catches it entering and 0.27s catches it crossing the shadow's
+edge.
+
+These parameters are one-directional in the same way the feed is. `?tier=`
+picks a *starting* tier and `?promote=` fires a real promotion; neither can
+walk anything backwards.
 
 ### Measuring frame time
 
@@ -834,7 +1009,11 @@ volumetric cone to a scene whose disk had just grown for free.
 - Never invent data. If an upstream call fails, degrade to the last known good
   value and flag it in the payload.
 - Nothing that has unlocked ever un-unlocks. Tiers, jets, and cosmetic
-  milestones are one-directional.
+  milestones are one-directional. The holder-driven camera distance is the one
+  live input, and even it is asymmetrically damped and floored at 1.15x the
+  all-time-peak distance.
+- A degraded payload changes nothing. Not the tier, not the holder target, not
+  a single uniform — it freezes every target and raises a quiet indicator.
 - 60fps on a 2020 MacBook Air, 30fps on a mid-range Android phone — *at the
   tier the governor settles on*. The top tier deliberately spends 4x the fill
   rate on supersampling and is allowed to run at 40fps; the governor stepping

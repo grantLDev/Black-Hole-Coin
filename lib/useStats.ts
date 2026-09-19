@@ -37,7 +37,15 @@ export interface UseStatsResult {
   lastError: string | null;
 }
 
-export function useStats(endpoint = "/api/stats"): UseStatsResult {
+/**
+ * @param endpoint  The stats route. Overridable for tests and fixtures.
+ * @param enabled   False stops the loop from ever starting. This exists for
+ *                  the capture harness: a screenshot compared against a
+ *                  reference has to be a pure function of its URL, and a live
+ *                  feed arriving mid-run would promote a tier or move the
+ *                  camera between the warm-up and the shot. `?feed=0`.
+ */
+export function useStats(endpoint = "/api/stats", enabled = true): UseStatsResult {
   const [stats, setStats] = useState<Stats | null>(null);
   const [connected, setConnected] = useState(false);
   const [lastError, setLastError] = useState<string | null>(null);
@@ -96,6 +104,7 @@ export function useStats(endpoint = "/api/stats"): UseStatsResult {
   }, [endpoint]);
 
   useEffect(() => {
+    if (!enabled) return;
     mountedRef.current = true;
 
     const schedule = (delay: number) => {
@@ -129,7 +138,7 @@ export function useStats(endpoint = "/api/stats"): UseStatsResult {
       if (timerRef.current !== null) clearTimeout(timerRef.current);
       abortRef.current?.abort();
     };
-  }, [poll, nextDelay]);
+  }, [poll, nextDelay, enabled]);
 
   return { stats, connected, lastError };
 }

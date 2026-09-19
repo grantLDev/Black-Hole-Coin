@@ -55,9 +55,11 @@ import { SCENE_FRAG, SCENE_VERT } from "./shaders/scene.glsl";
  * Smallest escape radius the marcher may use, in Schwarzschild radii.
  *
  * The brief's terminate-on-escape test is `length(pos) > 40`. It is expressed
- * as a floor rather than a constant because the camera radius becomes
- * holder-driven in a later prompt: if the camera ever sat beyond the escape
- * radius, every ray would "escape" on its first step and the hole would vanish.
+ * as a floor rather than a constant because the camera radius IS holder-driven:
+ * if the camera ever sat beyond the escape radius, every ray would "escape" on
+ * its first step and the hole would vanish. `setCamera` raises the radius to
+ * 1.5x the camera's own distance whenever that exceeds the floor, so the
+ * holder channel can move the camera anywhere without the marcher noticing.
  */
 const MIN_ESCAPE_RADIUS = 40;
 
@@ -75,6 +77,7 @@ interface SceneUniforms {
   readonly uDiskColorInner: IUniform<Vector3>;
   readonly uDiskColorOuter: IUniform<Vector3>;
   readonly uJetStrength: IUniform<number>;
+  readonly uRipple: IUniform<Vector2>;
   readonly uQualitySteps: IUniform<number>;
   readonly uStepScale: IUniform<number>;
   readonly uTurnLimit: IUniform<number>;
@@ -129,6 +132,7 @@ export class FullscreenPass {
       uDiskColorInner: { value: new Vector3(1, 0.79, 0.54) },
       uDiskColorOuter: { value: new Vector3(0.64, 0.24, 0.04) },
       uJetStrength: { value: 0 },
+      uRipple: { value: new Vector2(0, 0) },
       uQualitySteps: { value: profile.marchSteps },
       uStepScale: { value: profile.marchStepScale },
       uTurnLimit: { value: profile.marchTurnLimit },
@@ -221,6 +225,20 @@ export class FullscreenPass {
     this.uniforms.uDiskColorInner.value.set(...values.diskColorInner);
     this.uniforms.uDiskColorOuter.value.set(...values.diskColorOuter);
     this.uniforms.uJetStrength.value = values.jetStrength;
+  }
+
+  /**
+   * The tier-up gravitational-wave ripple: amplitude and 0..1 phase.
+   *
+   * Amplitude 0 on every frame outside a promotion's first 0.4 seconds, which
+   * is what lets the shader skip the displacement with a uniform branch rather
+   * than evaluating a packet that contributes nothing.
+   */
+  setRipple(amount: number, phase: number): void {
+    this.uniforms.uRipple.value.set(
+      Number.isFinite(amount) ? Math.max(0, amount) : 0,
+      Number.isFinite(phase) ? Math.min(Math.max(phase, 0), 1) : 0,
+    );
   }
 
   /** Drawing-buffer size, in device pixels. */

@@ -8,20 +8,31 @@
  * white flash before hydration; this component's only job is to find it and
  * hand it to the renderer.
  *
- * It renders a debug overlay when the URL carries `?debug`, and a legible
- * message if WebGL2 is unavailable — an unexplained black rectangle is the
- * worst possible failure mode for a site that is nothing but a canvas.
+ * It renders a debug overlay when the URL carries `?debug`, the HUD, and a
+ * legible message if WebGL2 is unavailable — an unexplained black rectangle is
+ * the worst possible failure mode for a site that is nothing but a canvas.
  *
- * The tier here comes from the URL, not from on-chain data. Binding the live
- * feed is a later prompt; what exists today is the whole path from a tier index
- * through the smoothing in VisualState to the shader's uniforms, which is the
- * part that has to be right before real data is pointed at it.
+ * THIS IS WHERE THE FEED MEETS THE PICTURE. `useStats` polls `/api/stats` and
+ * every payload is handed straight to the renderer, which passes it to
+ * `SceneDirector`. Nothing is interpreted on the way: the tier index is used
+ * exactly as the server computed it from the all-time-high market cap, and the
+ * holder count is used exactly as reported. Every rule about what may move and
+ * in which direction lives in the director, one layer down, where it can be
+ * tested without a browser.
+ *
+ * The URL overrides below are debug affordances and are deliberately
+ * one-directional in the same way the feed is — `?tier=` picks a STARTING
+ * tier and `?promote=` fires a real promotion, and neither can walk anything
+ * backwards.
  */
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import Hud, { type Announcement } from "@/components/Hud";
 import { SINGULARITY_CANVAS_ID } from "@/lib/gl/canvas";
 import { createRenderer, type RendererStats, type SingularityRenderer } from "@/lib/gl/Renderer";
 import type { QualityTier } from "@/lib/gl/quality";
+import type { Stats } from "@/lib/statsTypes";
+import { useStats } from "@/lib/useStats";
 import { MAX_TIER_INDEX } from "@/config/tiers";
 
 const QUALITY_TIERS: readonly string[] = ["low", "medium", "high"];
@@ -117,9 +128,23 @@ function readPost(params: URLSearchParams): boolean | undefined {
   return undefined;
 }
 
-function readTier(params: URLSearchParams): number | undefined {
-  const value = readNumber(params, "tier");
+function readTier(params: URLSearchParams, key = "tier"): number | undefined {
+  const value = readNumber(params, key);
   return value === undefined ? undefined : Math.min(Math.max(Math.round(value), 0), MAX_TIER_INDEX);
+}
+
+/**
+ * `?feed=0` stops the stats poller from ever starting.
+ *
+ * The capture harness needs every frame to be a pure function of its URL. A
+ * live payload landing between the warm-up frames and the screenshot would
+ * move the camera or fire a promotion, and the resulting image would differ
+ * from the reference for reasons that have nothing to do with the change being
+ * reviewed.
+ */
+function readFeedEnabled(params: URLSearchParams): boolean {
+  const value = params.get("feed");
+  return !(value === "0" || value === "false");
 }
 
 /** Unmasked GPU string, for labelling a benchmark honestly. */
@@ -135,6 +160,42 @@ export default function RendererMount() {
   const [stats, setStats] = useState<RendererStats | null>(null);
   const [debug, setDebug] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [announcement, setAnnouncement] = useState<Announcement | null>(null);
+
+  const rendererRef = useRef<SingularityRenderer | null>(null);
+  /**
+   * The most recent payload, so a renderer built after one has already landed
+   * is not left blind until the next poll five seconds later.
+   *
+   * React's StrictMode double-mount in development is the everyday case: the
+   * hook's state survives the remount, so the effect that forwards payloads
+   * does not re-fire, and without this the second renderer would spend five
+   * seconds at the zero-holder default before catching up.
+   */
+  const latestStatsRef = useRef<Stats | null>(null);
+
+  // Parsed once, in a lazy initialiser rather than an effect, so the very
+  // first render already knows whether to poll. It affects no markup — this
+  // component renders nothing until an effect has run — so there is no
+  // hydration mismatch to worry about.
+  const [params] = useState<URLSearchParams>(() =>
+    typeof window === "undefined"
+      ? new URLSearchParams()
+      : new URLSearchParams(window.location.search),
+  );
+
+  const { stats: feed, connected } = useStats("/api/stats", readFeedEnabled(params));
+
+  /**
+   * Read the announcement's opacity straight off the renderer's event clock.
+   *
+   * Stable across renders, because the HUD restarts its rAF loop whenever this
+   * identity changes and the loop must outlive every unrelated re-render.
+   */
+  const announceOpacity = useCallback(() => rendererRef.current?.feed.readAnnounceOpacity() ?? 0, []);
+  /** False once the event's six-second slot has ended, which retires the card. */
+  const announceActive = useCallback(() => rendererRef.current?.feed.activeEvent != null, []);
+  const clearAnnouncement = useCallback(() => setAnnouncement(null), []);
 
   useEffect(() => {
     const canvas = document.getElementById(SINGULARITY_CANVAS_ID);
@@ -153,8 +214,12 @@ export default function RendererMount() {
     //   ?fov=38          vertical field of view in degrees
     //   ?steps=140       override the march budget, under the compiled ceiling
     //   ?post=0          force the post chain off (?post=1 forces it on)
+    //   ?holders=2500    pin the holder count, bypassing the feed
+    //   ?peak=9000       pin the all-time-peak holder count (the distance floor)
+    //   ?promote=6       fire a real tier-up choreography up to tier 6
+    //   ?event=0.2       freeze the active choreography at 0.2s, for a still
+    //   ?feed=0          never poll /api/stats, so the frame is URL-determined
     //   ?bench           pin a 1920x1080 buffer and measure frame time
-    const params = new URLSearchParams(window.location.search);
     const wantDebug = params.has("debug");
     const wantBench = params.has("bench");
     setDebug(wantDebug || wantBench);
@@ -174,7 +239,14 @@ export default function RendererMount() {
         // because watching it degrade on a real device is the point of pinning.
         lockQuality: wantBench,
         onStats: wantDebug || wantBench ? setStats : undefined,
+        // `key` forces a remount, so a queued run of promotions restarts the
+        // fade for each tier instead of cross-fading one name into the next.
+        // The card retires itself when the renderer's own event clock says the
+        // slot has ended — see the note in Hud.tsx.
+        onPromote: (tier) =>
+          setAnnouncement({ name: tier.name, threshold: tier.threshold, key: Date.now() }),
       });
+      rendererRef.current = renderer;
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "The renderer failed to start.");
       return;
@@ -185,6 +257,24 @@ export default function RendererMount() {
 
     const steps = readNumber(params, "steps");
     if (steps !== undefined) renderer.setQualitySteps(steps);
+
+    // Seeded before any promotion, so a pinned event plays against the framing
+    // the shot asked for rather than against the zero-holder default.
+    const holders = readNumber(params, "holders");
+    if (holders !== undefined) {
+      renderer.feed.setHolders(holders, readNumber(params, "peak") ?? holders);
+    }
+
+    // `?event=` needs something to freeze, so it implies a promotion one step
+    // above wherever the renderer started.
+    const pinnedEvent = readNumber(params, "event");
+    const promote = readTier(params, "promote");
+    if (promote !== undefined) renderer.setTier(promote);
+    else if (pinnedEvent !== undefined) renderer.setTier(renderer.visualState.tier.index + 1);
+    if (pinnedEvent !== undefined) renderer.feed.pinEventClock(pinnedEvent);
+
+    // Only ever non-null on a remount; see latestStatsRef.
+    if (latestStatsRef.current) renderer.applyStats(latestStatsRef.current);
 
     const stopBench = wantBench ? startBenchmark(renderer, canvas) : undefined;
 
@@ -198,9 +288,18 @@ export default function RendererMount() {
     return () => {
       delete window.__singularityCapture;
       stopBench?.();
+      rendererRef.current = null;
       renderer.dispose();
     };
-  }, []);
+  }, [params]);
+
+  // Every payload goes straight through. The director decides what a payload
+  // is allowed to change — including that a degraded one changes nothing.
+  useEffect(() => {
+    if (!feed) return;
+    latestStatsRef.current = feed;
+    rendererRef.current?.applyStats(feed);
+  }, [feed]);
 
   if (error) {
     return (
@@ -210,17 +309,40 @@ export default function RendererMount() {
     );
   }
 
-  if (!debug || !stats) return null;
+  // The feed is flagged when the server says so, and also when the poller has
+  // stopped answering at all — from the viewer's side those are the same fact:
+  // what is on screen is no longer live.
+  const degraded = feed !== null && (feed.degraded || !connected);
 
   return (
-    <pre className="pointer-events-none absolute bottom-3 left-3 m-0 font-mono text-[11px] leading-[1.45] text-white/35 tabular-nums">
-      {stats.fps.toFixed(1)} fps · {stats.frameMs.toFixed(1)} ms{"\n"}
-      {stats.quality} · dpr {stats.pixelRatio.toFixed(2)} · {stats.marchSteps} steps
-      {"\n"}
-      {stats.bufferWidth}×{stats.bufferHeight}
-      {"\n"}
-      post {stats.post ? `on · ${stats.bloomLevels} bloom levels` : "off"}
-    </pre>
+    <>
+      <Hud
+        announcement={announcement}
+        announceOpacity={announceOpacity}
+        announceActive={announceActive}
+        onAnnounceEnded={clearAnnouncement}
+        degraded={degraded}
+      />
+      {debug && stats ? (
+        <pre className="pointer-events-none absolute bottom-3 left-3 m-0 font-mono text-[11px] leading-[1.45] text-white/35 tabular-nums">
+          {stats.fps.toFixed(1)} fps · {stats.frameMs.toFixed(1)} ms{"\n"}
+          {stats.quality} · dpr {stats.pixelRatio.toFixed(2)} · {stats.marchSteps} steps
+          {"\n"}
+          {stats.bufferWidth}×{stats.bufferHeight}
+          {"\n"}
+          post {stats.post ? `on · ${stats.bloomLevels} bloom levels` : "off"}
+          {"\n"}
+          tier {stats.feed.tierIndex}
+          {stats.feed.queued > 0 ? ` (+${stats.feed.queued} queued)` : ""} · d{" "}
+          {stats.feed.cameraDistance.toFixed(2)} rs
+          {"\n"}
+          holders {Math.round(stats.feed.liveHolders).toLocaleString("en-US")} · peak{" "}
+          {Math.round(stats.feed.peakHolders).toLocaleString("en-US")}
+          {stats.feed.degraded ? " · degraded" : ""}
+          {stats.feed.hasData ? "" : " · no feed"}
+        </pre>
+      ) : null}
+    </>
   );
 }
 

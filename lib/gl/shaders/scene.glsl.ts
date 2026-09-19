@@ -14,6 +14,28 @@ import { HASH_GLSL, NOISE_GLSL, TONEMAP_GLSL } from "./common.glsl";
 import { SKY_GLSL } from "./sky.glsl";
 
 /**
+ * Half-width of the gravitational-wave packet, in aspect-corrected screen
+ * units where the frame is 2 units tall.
+ *
+ * 0.16 makes the packet about a sixth of the frame height across. Much
+ * narrower and it aliases into a hard ring as it crosses the photon ring;
+ * much wider and the whole frame moves together, which reads as a camera bump
+ * rather than as something passing through.
+ */
+const RIPPLE_WIDTH = 0.16;
+
+/**
+ * Peak radial displacement at full amplitude, in the same units.
+ *
+ * 0.055 is about 3% of the frame height — enough that the shadow's edge
+ * visibly bows as the front crosses it, and small enough that nothing leaves
+ * the frame and comes back. This is the largest number in the whole tier-up
+ * event and the easiest one to overdo: past roughly 0.1 the photon ring tears
+ * into two arcs and the effect stops being a wave and starts being a glitch.
+ */
+const RIPPLE_GAIN = 0.055;
+
+/**
  * Clip-space passthrough.
  *
  * The attribute is named `position` because three.js reads the draw count from
@@ -88,17 +110,71 @@ uniform vec2 uResolution;
  */
 uniform float uExposure;
 
+/**
+ * Gravitational-wave ripple: x is amplitude (0 disables), y is 0..1 phase.
+ *
+ * THE FIRST CUE OF A TIER-UP, and the only one that touches the shader. A
+ * wave packet enters from beyond the frame corner and sweeps to the centre
+ * over 0.4 seconds, displacing each ray radially as it passes.
+ *
+ * It is applied to the RAY DIRECTION rather than as a screen-space UV warp in
+ * the post chain, for three reasons. The post chain does not exist on the low
+ * quality tier, and a milestone that is invisible on a phone is not a
+ * milestone. Warping the finished frame stretches the bloom and the grain
+ * along with the image, which reads as the monitor flexing rather than as
+ * spacetime doing it. And bending the rays is what a passing wave actually
+ * does — the lensed sky, the photon ring and the disk all distort together,
+ * consistently, because they are all downstream of the same bent geodesic.
+ *
+ * The cost is a handful of ALU against a 300-step march, behind a uniform
+ * branch that is false on every frame outside those 0.4 seconds.
+ */
+uniform vec2 uRipple;
+
+const float RIPPLE_WIDTH = ${RIPPLE_WIDTH.toFixed(4)};
+const float RIPPLE_GAIN = ${RIPPLE_GAIN.toFixed(4)};
+
 ${HASH_GLSL}
 ${NOISE_GLSL}
 ${SKY_GLSL}
 ${BLACKHOLE_GLSL}
 ${TONEMAP_GLSL}
 
+/**
+ * Radial displacement of one aspect-corrected screen coordinate.
+ *
+ * The packet is a Gaussian envelope on one sine cycle, so it is a single
+ * compression followed by a single rarefaction with no ringing on either side
+ * — a pulse, not a ripple pattern. Its centre travels from the reach (just
+ * outside the frame corner, computed from the actual aspect so a 21:9 monitor
+ * is not clipped into the wave a frame late) to just inside zero, which means
+ * it enters and leaves the frame under its own geometry. That is why no
+ * amplitude envelope is needed: a fade would blunt the wavefront exactly as it
+ * crossed the shadow, which is where it is supposed to bite hardest.
+ */
+vec2 rippleOffset(vec2 frame) {
+  float r = length(frame);
+  // At the exact centre there is no radial direction. One pixel, and the
+  // packet is a hair away from leaving anyway.
+  if (r < 1.0e-5) return vec2(0.0);
+
+  float reach = length(vec2(uResolution.x / uResolution.y, 1.0)) + 3.0 * RIPPLE_WIDTH;
+  float front = mix(reach, -3.0 * RIPPLE_WIDTH, uRipple.y);
+  float d = (r - front) / RIPPLE_WIDTH;
+
+  float packet = exp(-0.5 * d * d) * sin(d * 1.9);
+  return (frame / r) * (packet * RIPPLE_GAIN * uRipple.x);
+}
+
 void main() {
   // vClip is exactly [-1,1] across the viewport: the triangle overhangs the
   // screen but interpolation is linear, so the clipped span is exact.
   vec2 ndc = vClip;
   ndc.x *= uResolution.x / uResolution.y;
+
+  // Aspect-corrected already, so "radial" is radial on the SCREEN. Skipped
+  // entirely outside a tier-up event's first 0.4 seconds.
+  if (uRipple.x > 0.0) ndc += rippleOffset(ndc);
 
   // The basis columns are (right, up, forward), so this is
   // right * x + up * y + forward * 1 with no matrix inverse and no sign

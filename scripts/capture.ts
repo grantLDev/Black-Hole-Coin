@@ -58,6 +58,21 @@ interface Shot {
 }
 
 /**
+ * Feed state every shot inherits unless it says otherwise.
+ *
+ * `feed=0` is the important half: a screenshot compared against a reference
+ * has to be a pure function of its URL, and a live payload landing between the
+ * warm-up and the shutter would move the camera or fire a promotion. The
+ * holder count is pinned too, because the camera's orbit radius is
+ * holder-driven — 2500 is an unremarkable working number that puts the camera
+ * at 10.8 rs, near where it sat when it was a constant.
+ *
+ * Appended AFTER each shot's own query, so a shot that sets `holders` wins:
+ * URLSearchParams.get returns the first occurrence of a repeated key.
+ */
+const PINNED_FEED = "feed=0&holders=2500&peak=2500";
+
+/**
  * Each of these isolates one claim from the brief, so a regression shows up in
  * a specific frame rather than as "the black hole looks different".
  */
@@ -89,6 +104,36 @@ const SHOTS: readonly Shot[] = [
   // Above the plane, to confirm the over-and-under wrap is lensing and not a
   // mirrored copy of the disk.
   { name: "10-oblique", query: "tier=11&t=33.4&quality=high" },
+
+  // ---- The holder channel ------------------------------------------------
+  // The same tier at both ends of the live mapping. `16` and `17` are the pair
+  // to compare: everything between them is what the holder count does, and it
+  // should read as the hole growing rather than as a zoom, because the disk
+  // widens within the tier's ceiling at the same time as the camera comes in.
+  { name: "16-holders-zero", query: "tier=8&t=0&quality=high&holders=0&peak=0" },
+  { name: "17-holders-peak", query: "tier=8&t=0&quality=high&holders=100000&peak=100000" },
+  // The peak floor, which is the whole "nothing un-unlocks" rule applied to a
+  // continuous quantity: every holder has left, and the frame is still within
+  // 13% of `17` rather than back at `16`.
+  { name: "18-holders-floor", query: "tier=8&t=0&quality=high&holders=0&peak=100000" },
+
+  // ---- The tier-up choreography ------------------------------------------
+  // `?event=` freezes the six-second timeline at one instant, which is the
+  // only way to photograph a 0.4-second ripple on purpose. The wavefront
+  // starts just beyond the frame corner and reaches the centre at 0.34s, so
+  // 0.08s has it entering at the corners and 0.27s has it crossing the
+  // shadow's edge — which is where it either bends the photon ring
+  // convincingly or tears it in two.
+  { name: "19-ripple-entering", query: "tier=6&t=0&quality=high&event=0.08" },
+  { name: "20-ripple-crossing", query: "tier=6&t=0&quality=high&event=0.27" },
+  // 0.55s is the peak of the brightness overshoot with the camera pushed in.
+  { name: "21-tier-up-overshoot", query: "tier=6&t=0&quality=high&event=0.55" },
+  // 2.0s: every transient is over, the HUD card is at full opacity, and the
+  // tier lerp is halfway to its new steady state.
+  { name: "22-tier-up-card", query: "tier=6&t=0&quality=high&event=2.0" },
+  // The ripple on the low tier, where there is no post chain to hide behind.
+  // A milestone that only exists on a desktop is not a milestone.
+  { name: "23-ripple-low-quality", query: "tier=6&t=0&quality=low&event=0.27" },
 ];
 
 async function collectErrors(page: Page, sink: string[]): Promise<void> {
@@ -139,7 +184,9 @@ async function captureShots(): Promise<void> {
     await collectErrors(page, errors);
 
     for (const shot of wanted) {
-      await page.goto(`${BASE_URL}/?debug&${shot.query}`, { waitUntil: "networkidle" });
+      await page.goto(`${BASE_URL}/?debug&${shot.query}&${PINNED_FEED}`, {
+        waitUntil: "networkidle",
+      });
       await waitForFirstFrame(page);
       const file = path.join(OUT_DIR, `${shot.name}.png`);
       // Generous: under SwiftShader a single 1080p frame at 300 steps takes
@@ -173,7 +220,9 @@ async function runBench(): Promise<void> {
 
     const quality = process.env.BENCH_QUALITY ?? "high";
     const tier = process.env.BENCH_TIER ?? "11";
-    await page.goto(`${BASE_URL}/?bench&quality=${quality}&tier=${tier}`, {
+    // Pinned feed here too: a promotion firing mid-run would add a ripple and
+    // a camera push to some of the measured frames and not others.
+    await page.goto(`${BASE_URL}/?bench&quality=${quality}&tier=${tier}&${PINNED_FEED}`, {
       waitUntil: "networkidle",
     });
 

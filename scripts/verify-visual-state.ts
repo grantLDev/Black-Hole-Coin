@@ -23,9 +23,17 @@ function check(name: string, ok: boolean, detail = ""): void {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}${detail ? `\n      ${detail}` : ""}`);
 }
 
-/** Run `seconds` of wall time through the smoother at a fixed frame rate. */
+/**
+ * Run `seconds` of wall time through the smoother at a fixed frame rate.
+ *
+ * Counted in FRAMES rather than by accumulating `t += dt`, so that two frame
+ * rates simulate exactly the same amount of wall time. Accumulating floats
+ * lands one loop short or long depending on the step, which shows up in the
+ * comparison below as drift the smoother is not actually responsible for.
+ */
 function advance(state: VisualState, seconds: number, dt = 1 / 60): void {
-  for (let t = 0; t < seconds; t += dt) state.update(dt);
+  const frames = Math.round(seconds / dt);
+  for (let frame = 0; frame < frames; frame += 1) state.update(dt);
 }
 
 // --- the tier ratchet -------------------------------------------------------
@@ -74,9 +82,10 @@ for (let frame = 0; frame < 600; frame += 1) {
 check("jet strength never decreases on any frame", nonDecreasing);
 
 // --- smoothing --------------------------------------------------------------
-// `1 - exp(-dt/tau)` rather than a fixed per-frame fraction: the naive form
-// converges at a speed that depends on frame rate, so an unlock tuned on a
-// desktop would take twice as long on a phone.
+// Progress advances by `dt / TIER_LERP_SECONDS`, so the same wall time buys
+// the same progress at any frame rate. The naive `x += (target - x) * k` form
+// converges at a speed that depends on frame rate instead, and an unlock tuned
+// on a desktop would take twice as long on a phone.
 const slow = new VisualState(0);
 const fast = new VisualState(0);
 slow.setTier(11);
@@ -84,7 +93,9 @@ fast.setTier(11);
 advance(slow, 3, 1 / 30);
 advance(fast, 3, 1 / 120);
 const drift = Math.abs(slow.read().diskOuterRadius - fast.read().diskOuterRadius);
-check("30fps and 120fps agree after 3s", drift < 0.05, `drift ${drift.toFixed(4)} rs`);
+// Equality to float noise, not mere convergence: a fixed-duration ease passes
+// through the same value at the same instant however finely it is sampled.
+check("30fps and 120fps agree after 3s", drift < 1e-9, `drift ${drift.toExponential(2)} rs`);
 
 const settled = new VisualState(0);
 settled.setTier(11);

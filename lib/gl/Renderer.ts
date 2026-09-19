@@ -37,10 +37,13 @@ import {
   WebGLRenderer,
 } from "three";
 
+import type { Tier } from "@/config/tiers";
+import type { Stats } from "@/lib/statsTypes";
 import { FullscreenPass } from "./FullscreenPass";
 import { OrbitCamera, type OrbitCameraOptions } from "./OrbitCamera";
 import { PostChain, isPostSupported } from "./PostChain";
-import { VisualState } from "./VisualState";
+import { SceneDirector, type FeedSummary } from "./SceneDirector";
+import type { VisualState } from "./VisualState";
 import {
   QualityGovernor,
   bufferPixelsPerScreenPixel,
@@ -94,6 +97,8 @@ export interface RendererStats {
   readonly post: boolean;
   /** Bloom pyramid levels actually allocated. 0 when post is off. */
   readonly bloomLevels: number;
+  /** Live feed state: tier, holders, camera distance, degraded flag. */
+  readonly feed: FeedSummary;
 }
 
 export interface RendererOptions {
@@ -146,6 +151,13 @@ export interface RendererOptions {
    * float; that check is not overridable.
    */
   readonly post?: boolean;
+  /**
+   * Fires at the instant a tier-up choreography starts, once per promotion.
+   *
+   * There is no matching demotion callback anywhere in this codebase, because
+   * there is no demotion.
+   */
+  readonly onPromote?: (tier: Tier) => void;
   /** Fires roughly four times a second while the loop is running. */
   readonly onStats?: (stats: RendererStats) => void;
 }
@@ -156,7 +168,7 @@ export class SingularityRenderer {
   private readonly pass: FullscreenPass;
   private readonly camera: OrbitCamera;
   private readonly governor: QualityGovernor;
-  private readonly visuals: VisualState;
+  private readonly director: SceneDirector;
   private readonly onStats?: (stats: RendererStats) => void;
   private readonly fixedTime: number | null;
   private readonly bufferSize: { readonly width: number; readonly height: number } | null;
@@ -223,7 +235,7 @@ export class SingularityRenderer {
     });
 
     this.camera = new OrbitCamera(options.camera);
-    this.visuals = new VisualState(options.tier ?? 0);
+    this.director = new SceneDirector({ tier: options.tier, onPromote: options.onPromote });
 
     // Probed once, from the same context the renderer will use. A driver that
     // cannot render to RGBA16F cannot run this chain at all, and no flag
@@ -247,7 +259,12 @@ export class SingularityRenderer {
 
   /** The smoothed tier state driving the shader. */
   get visualState(): VisualState {
-    return this.visuals;
+    return this.director.visualState;
+  }
+
+  /** The feed binding: tier ratchet, holder spring, tier-up choreography. */
+  get feed(): SceneDirector {
+    return this.director;
   }
 
   /** Whether the post chain is currently running. */
@@ -278,13 +295,27 @@ export class SingularityRenderer {
   }
 
   /**
-   * Aim the visuals at a tier index, 0..11.
+   * Hand one `/api/stats` payload to the feed binding.
    *
-   * Ratcheted, and deliberately so — see VisualState. The transition is
-   * smoothed over a couple of seconds; jets fade in over four and never out.
+   * Everything about how it is interpreted — the tier ratchet, the promotion
+   * queue, the asymmetric holder spring, the freeze on a degraded payload —
+   * lives in `SceneDirector`. Safe to call at any rate, including twice with
+   * the same payload.
+   */
+  applyStats(stats: Stats): void {
+    this.director.applyStats(stats);
+  }
+
+  /**
+   * Promote to a tier index, 0..11, WITH the full six-second choreography.
+   *
+   * Ratcheted, and deliberately so — see VisualState. Multiple steps queue and
+   * play one at a time. This is the runtime path; the constructor's `tier`
+   * option instead adopts its tier silently, because a page load is not an
+   * unlock.
    */
   setTier(index: number): void {
-    this.visuals.setTier(index);
+    this.director.promoteTo(index);
   }
 
   /** Vertical field of view in degrees. Applied on the next frame. */
@@ -366,7 +397,7 @@ export class SingularityRenderer {
     // Clamped so a GC pause or a device sleep cannot teleport the camera.
     const deltaSeconds = Math.min(frameMs, MAX_FRAME_DELTA_MS) / 1000;
     this.elapsed += deltaSeconds;
-    this.visuals.update(deltaSeconds);
+    this.director.update(deltaSeconds);
 
     this.draw();
     if (!this.lockQuality) this.governor.sample(frameMs);
@@ -375,13 +406,23 @@ export class SingularityRenderer {
 
   private draw(): void {
     const sceneTime = this.fixedTime ?? this.elapsed;
+
+    // The holder channel and the tier's shake reach the camera here, one frame
+    // at a time, already composed and clamped by the director. The camera
+    // itself neither smooths nor clamps them — see OrbitCamera.setRadius.
+    const view = this.director.readCamera();
+    this.camera.setRadius(view.distance);
+    this.camera.setShake(view.shakeAmplitude, view.shakeFrequency);
     this.camera.update(sceneTime);
     this.pass.setCamera(this.camera);
+
+    const ripple = this.director.readRipple();
+    this.pass.setRipple(ripple.amount, ripple.phase);
     // Wrapped only for the shader: see SHADER_TIME_WRAP_SECONDS. `%` on a
     // non-negative left operand is a plain modulo here.
     const shaderTime = sceneTime % SHADER_TIME_WRAP_SECONDS;
     this.pass.setTime(shaderTime);
-    this.pass.setVisuals(this.visuals.read());
+    this.pass.setVisuals(this.director.readScene());
     this.pass.setExposure(this.renderer.toneMappingExposure);
 
     if (!this.post) {
@@ -389,7 +430,7 @@ export class SingularityRenderer {
       return;
     }
 
-    this.post.setVisuals(this.visuals.readPost());
+    this.post.setVisuals(this.director.readPost());
     this.post.setExposure(this.renderer.toneMappingExposure);
     this.post.setTime(shaderTime);
 
@@ -417,6 +458,7 @@ export class SingularityRenderer {
       marchSteps: this.governor.current.marchSteps,
       post: this.post !== null,
       bloomLevels: this.post?.levelCount ?? 0,
+      feed: this.director.summary(),
     });
 
     this.statsWindowStart = now;
